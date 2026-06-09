@@ -612,24 +612,12 @@ def lovable_rest_url(table_name: str) -> str:
     return f"{LOVABLE_DB_URL}/rest/v1/{table_name}"
 
 
-def lovable_select(
-    table_name: str,
-    filters: Optional[dict[str, Any]] = None,
-    select_cols: str = "*",
-    limit: Optional[int] = None,
-    order: Optional[str] = None,
-) -> list[dict[str, Any]]:
-    params: dict[str, Any] = {"select": select_cols}
-    if filters:
-        for key, value in filters.items():
-            if value is None:
-                continue
-            params[key] = f"eq.{value}"
-    if limit:
-        params["limit"] = str(limit)
-    if order:
-        params["order"] = order
+# O PostgREST/Supabase limita cada resposta a ~1000 linhas (max-rows). Para
+# trazer mais que isso, paginamos via offset.
+LOVABLE_PAGE_SIZE = 1000
 
+
+def _lovable_get_page(table_name: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     try:
         resp = _http_session.get(
             lovable_rest_url(table_name),
@@ -646,6 +634,48 @@ def lovable_select(
             detail=f"Erro lendo {table_name} | status={resp.status_code} | body={resp.text}"
         )
     return resp.json()
+
+
+def lovable_select(
+    table_name: str,
+    filters: Optional[dict[str, Any]] = None,
+    select_cols: str = "*",
+    limit: Optional[int] = None,
+    order: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    base_params: dict[str, Any] = {"select": select_cols}
+    if filters:
+        for key, value in filters.items():
+            if value is None:
+                continue
+            base_params[key] = f"eq.{value}"
+    if order:
+        base_params["order"] = order
+
+    # Caso simples: limite pequeno (<= 1 página) ou sem limite -> 1 request.
+    if not limit or limit <= LOVABLE_PAGE_SIZE:
+        params = dict(base_params)
+        if limit:
+            params["limit"] = str(limit)
+        return _lovable_get_page(table_name, params)
+
+    # Limite grande -> pagina via offset até atingir o alvo ou acabar.
+    all_rows: list[dict[str, Any]] = []
+    offset = 0
+    while len(all_rows) < limit:
+        page_size = min(LOVABLE_PAGE_SIZE, limit - len(all_rows))
+        params = dict(base_params)
+        params["limit"] = str(page_size)
+        params["offset"] = str(offset)
+
+        batch = _lovable_get_page(table_name, params)
+        all_rows.extend(batch)
+
+        if len(batch) < page_size:
+            break  # última página
+        offset += len(batch)
+
+    return all_rows
 
 
 def lovable_insert(table_name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1081,10 +1111,58 @@ def get_sync_status(user=Depends(get_current_user)):
     }
 
 
+def _filtrar_lotes_por_q(rows: list[dict[str, Any]], q: Optional[str]) -> list[dict[str, Any]]:
+    """Busca livre nos lotes. Normaliza dígitos para que '650.066' ache '650066'."""
+    q_s = clean_str(q)
+    if not q_s:
+        return rows
+
+    q_lower = q_s.lower()
+    q_digits = re.sub(r"\D", "", q_s)
+
+    filtered = []
+    for row in rows:
+        haystack = " ".join([
+            clean_str(row.get("lot_key")),
+            clean_str(row.get("lot_number")),
+            clean_str(row.get("erp_codlot")),
+            clean_str(row.get("erp_codfor")),
+            clean_str(row.get("supplier_name")),
+            clean_str(row.get("erp_numnfc")),
+            clean_str(row.get("erp_codsnf")),
+            clean_str(row.get("erp_codcer")),
+            clean_str(row.get("certificate_code")),
+            clean_str(row.get("erp_codpro")),
+            clean_str(row.get("product_code")),
+            clean_str(row.get("erp_codder")),
+            clean_str(row.get("derivation_code")),
+            clean_str(row.get("product_description")),
+            clean_str(row.get("invoice_item_description")),
+            clean_str(row.get("erp_codfam")),
+            clean_str(row.get("family_code")),
+            clean_str(row.get("family_description")),
+            clean_str(row.get("erp_codori")),
+            clean_str(row.get("origin_code")),
+            clean_str(row.get("purchase_order")),
+            clean_str(row.get("sync_reason")),
+            clean_str(row.get("status_app")),
+            clean_str(row.get("status_erp")),
+        ]).lower()
+
+        haystack_digits = re.sub(r"\D", "", haystack)
+
+        if q_lower in haystack or (q_digits and q_digits in haystack_digits):
+            filtered.append(row)
+
+    return filtered
+
+
 @app.get("/api/erp/lotes")
 def get_lotes(
     status_app: Optional[str] = Query(default=None),
     status_erp: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None),
+    limit: int = Query(default=50000, ge=1, le=50000),
     user=Depends(get_current_user),
 ):
     filters = {}
@@ -1093,7 +1171,8 @@ def get_lotes(
     if status_erp:
         filters["status_erp"] = status_erp
 
-    rows = lovable_select(TABLE_LOTS, filters=filters, order="updated_at.desc")
+    rows = lovable_select(TABLE_LOTS, filters=filters, order="updated_at.desc", limit=limit)
+    rows = _filtrar_lotes_por_q(rows, q)
     return {"total": len(rows), "dados": rows}
 
 
@@ -1101,44 +1180,19 @@ def get_lotes(
 def get_certificados_qualidade(
     status_app: Optional[str] = Query(default=None),
     q: Optional[str] = Query(default=None),
+    limit: int = Query(default=50000, ge=1, le=50000),
     user=Depends(get_current_user),
 ):
-    filters = {}
-    if status_app:
-        filters["status_app"] = status_app
-
-    rows = lovable_select(TABLE_LOTS, filters=filters, order="updated_at.desc")
-
-    if q:
-        q_lower = clean_str(q).lower()
-        filtered = []
-        for row in rows:
-            haystack = " ".join([
-                clean_str(row.get("lot_key")),
-                clean_str(row.get("lot_number")),
-                clean_str(row.get("erp_codcer")),
-                clean_str(row.get("erp_numnfc")),
-                clean_str(row.get("supplier_name")),
-                clean_str(row.get("erp_codpro")),
-                clean_str(row.get("erp_codfam")),
-                clean_str(row.get("erp_codori")),
-                clean_str(row.get("product_description")),
-                clean_str(row.get("invoice_item_description")),
-                clean_str(row.get("purchase_order")),
-            ]).lower()
-
-            if q_lower in haystack:
-                filtered.append(row)
-
-        rows = filtered
-
-    return {"total": len(rows), "dados": rows}
+    return get_lotes(status_app=status_app, status_erp=None, q=q, limit=limit, user=user)
 
 
 @app.get("/api/erp/lotes/pendentes")
-def get_lotes_pendentes(user=Depends(get_current_user)):
-    rows = lovable_select(TABLE_LOTS, filters={"status_app": "PENDENTE"}, order="updated_at.desc")
-    return {"total": len(rows), "dados": rows}
+def get_lotes_pendentes(
+    q: Optional[str] = Query(default=None),
+    limit: int = Query(default=50000, ge=1, le=50000),
+    user=Depends(get_current_user),
+):
+    return get_lotes(status_app="PENDENTE", status_erp=None, q=q, limit=limit, user=user)
 
 
 @app.get("/api/erp/lotes/{lot_key}")

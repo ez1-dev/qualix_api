@@ -451,6 +451,26 @@ Etiquetas de entrada de estoque por obra/desenho.
 
 ---
 
+## 14. Busca robusta na listagem de lotes + paginação do Supabase
+
+**Problema:** o lote existia no Supabase mas a tela não achava — `/api/erp/lotes` não tinha
+`q`/`limit`, e o `lovable_select` trazia só **1000 linhas** (cap `max-rows` do PostgREST),
+escondendo lotes (tabela tem 6.759).
+
+**Mudanças:**
+- `lovable_select` agora **pagina** via `offset` (páginas de 1000) quando `limit > 1000` —
+  traz todos os registros além do cap do PostgREST. Para `limit <= 1000` mantém 1 request.
+- `/api/erp/lotes` ganhou `q` (busca livre) e `limit` (default 50000). Helper
+  `_filtrar_lotes_por_q` com **normalização de dígitos** (`650.066` acha `650066`) sobre
+  ~24 campos (lote, NF, fornecedor, produto, família, origem, certificado, sync_reason, etc.).
+- `/api/erp/certificados-qualidade` e `/api/erp/lotes/pendentes` delegam ao `get_lotes`
+  (mesma busca, sem divergência entre telas).
+
+> Validado: `q=26000419`→1, `q=650066`→7 (inclui 26000419/26000420), `q=650.066`→mesmos 7,
+> sem `q`→6.759. PostgREST capava em 1000 sem a paginação.
+
+---
+
 ## Resumo de endpoints novos
 
 | Método | Rota |
