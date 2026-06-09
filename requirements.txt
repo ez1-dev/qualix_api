@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pyodbc
+requests
+python-dotenv
+python-jose
+pydantic
+pymupdf
+pillow
+python-multipart
+apscheduler
