@@ -471,6 +471,28 @@ escondendo lotes (tabela tem 6.759).
 
 ---
 
+## 15. Sync não apaga aprovação local (proteção contra perda de dados)
+
+**Problema:** ao aprovar, o app gravava no Supabase, mas a próxima sincronização ERP→Supabase
+sobrescrevia os campos com o ERP. Se o ERP ainda estava "Certificado pendente"/branco, o
+certificado e o status voltavam a ficar em branco (`build_lots_payload` mandava
+`certificate_code=""`, `status_app="PENDENTE"`).
+
+**Mudanças (`run_lotes_sync`):**
+- Antes do upsert, para os lotes que o ERP traz **PENDENTES**, lê o estado atual no Supabase
+  (`_fetch_existing_lots_map`, via filtro `lot_key=in.(...)` em chunks) e **preserva**
+  (`_preservar_aprovacao_local`): `certificate_code`, `erp_codcer`, `erp_anexo_codcer`,
+  `erp_camdoc`, `certificate_count/pages_count`.
+- `status_erp` continua refletindo o ERP (pode vir PENDENTE), mas `status_app` **não regride**
+  para PENDENTE quando o app já avançou (EM_ANALISE / EM_REVISAO / EXPORTADO / APROVADO / ...).
+- Resposta do sync ganhou `lotes_pendentes_preservados`.
+
+> A fonte final correta continua sendo o ERP: o front deve aprovar via
+> `POST /api/erp/certificados/aprovar[-multiplos]` (que grava ERP + Supabase), não só no Supabase.
+> Esta proteção é a rede de segurança para não perder dados se o ERP vier pendente.
+
+---
+
 ## Resumo de endpoints novos
 
 | Método | Rota |

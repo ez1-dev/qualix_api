@@ -985,6 +985,55 @@ def build_lots_payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(grouped.values())
 
 
+# Status_app que representam progresso no app e NÃO devem ser revertidos para
+# PENDENTE pela sincronização quando o ERP ainda estiver pendente.
+STATUS_APP_PROGRESSO = {
+    "EM_ANALISE", "EM_REVISAO", "EXPORTADO", "APROVADO",
+    "REPROVADO", "DESVIO_JUSTIFICADO", "ANALYZED", "APPROVED",
+    "APPROVED_WITH_DEVIATION", "REJECTED", "UPLOADED",
+}
+
+
+def _fetch_existing_lots_map(lot_keys: list[str]) -> dict[str, dict[str, Any]]:
+    """Lê do Supabase os campos de certificado/status dos lotes informados."""
+    cols = (
+        "lot_key,certificate_code,erp_codcer,erp_anexo_codcer,erp_camdoc,"
+        "certificate_count,certificate_pages_count,status_app"
+    )
+    out: dict[str, dict[str, Any]] = {}
+    CHUNK = 150
+    for i in range(0, len(lot_keys), CHUNK):
+        chunk = [k for k in lot_keys[i:i + CHUNK] if k]
+        if not chunk:
+            continue
+        in_list = ",".join('"' + str(k).replace('"', '') + '"' for k in chunk)
+        params = {"select": cols, "lot_key": f"in.({in_list})", "limit": str(len(chunk))}
+        for r in _lovable_get_page(TABLE_LOTS, params):
+            out[clean_str(r.get("lot_key"))] = r
+    return out
+
+
+def _preservar_aprovacao_local(lot_payload: dict[str, Any], existente: dict[str, Any]) -> None:
+    """Quando o ERP vem pendente, não apaga o certificado/status que o app já
+    gravou no Supabase. status_erp segue refletindo o ERP; status_app não regride."""
+    if clean_str(existente.get("certificate_code")):
+        lot_payload["certificate_code"] = clean_str(existente.get("certificate_code"))
+    if clean_str(existente.get("erp_codcer")):
+        lot_payload["erp_codcer"] = clean_str(existente.get("erp_codcer"))
+    if clean_str(existente.get("erp_anexo_codcer")):
+        lot_payload["erp_anexo_codcer"] = clean_str(existente.get("erp_anexo_codcer"))
+    if clean_str(existente.get("erp_camdoc")):
+        lot_payload["erp_camdoc"] = clean_str(existente.get("erp_camdoc"))
+    if int(existente.get("certificate_count") or 0) > 0:
+        lot_payload["certificate_count"] = existente.get("certificate_count")
+    if int(existente.get("certificate_pages_count") or 0) > 0:
+        lot_payload["certificate_pages_count"] = existente.get("certificate_pages_count")
+
+    status_local = clean_str(existente.get("status_app")).upper()
+    if status_local and status_local != "PENDENTE":
+        lot_payload["status_app"] = existente.get("status_app")
+
+
 def run_lotes_sync(
     codemp: int = EMPRESA_PADRAO,
     codfil: Optional[int] = None,
@@ -1004,6 +1053,20 @@ def run_lotes_sync(
     )
 
     payload = build_lots_payload(erp_rows)
+
+    # Proteção contra perda de dados: para lotes que o ERP traz PENDENTES, não
+    # sobrescrever o certificado/status que o app já gravou no Supabase.
+    pendentes = [p for p in payload if clean_str(p.get("status_erp")).upper() == "PENDENTE"]
+    preservados = 0
+    if pendentes:
+        existentes = _fetch_existing_lots_map([p["lot_key"] for p in pendentes])
+        for p in pendentes:
+            ex = existentes.get(clean_str(p.get("lot_key")))
+            if ex:
+                _preservar_aprovacao_local(p, ex)
+                if clean_str(ex.get("certificate_code")) or clean_str(ex.get("status_app")).upper() not in ("", "PENDENTE"):
+                    preservados += 1
+
     saved = lovable_upsert_many(TABLE_LOTS, payload, on_conflict="lot_key")
 
     return {
@@ -1013,6 +1076,7 @@ def run_lotes_sync(
         "finished_at": now_iso(),
         "lotes_lidos_erp": len(erp_rows),
         "lotes_upsert_lovable": len(payload),
+        "lotes_pendentes_preservados": preservados,
         "saved_preview": saved[:3] if isinstance(saved, list) else saved,
     }
 
