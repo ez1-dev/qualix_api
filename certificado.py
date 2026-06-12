@@ -5,7 +5,7 @@ import uuid
 import shutil
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import pyodbc
 import requests
@@ -159,6 +159,13 @@ class ApproveMultipleRequest(BaseModel):
     certificate_code: str
     approved_by: Optional[str] = None
     notes: Optional[str] = None
+
+
+class ImportDocumentRequest(BaseModel):
+    lot_key: Optional[str] = None
+    original_file_name: str
+    source_url: str
+    uploaded_by: Optional[str] = None
 
 
 class RejectRequest(BaseModel):
@@ -1431,6 +1438,132 @@ def upload_document_alias(
 ):
     # Alias para compatibilidade com o front-end/Lovable.
     return upload_document(lot_key=lot_key, file=file, uploaded_by=uploaded_by, user=user)
+
+
+IMPORT_EXTS_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+IMPORT_MAX_BYTES = 60 * 1024 * 1024  # 60 MB
+_MIME_POR_EXT = {
+    ".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".bmp": "image/bmp", ".webp": "image/webp",
+    ".tif": "image/tiff", ".tiff": "image/tiff",
+}
+
+
+def _validar_source_url(source_url: str) -> None:
+    """Bloqueia SSRF: só permite https para o host do Supabase do projeto."""
+    parsed = urlparse(source_url)
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=400, detail="source_url deve ser https.")
+
+    host = (parsed.hostname or "").lower()
+    lov_host = (urlparse(LOVABLE_DB_URL).hostname or "").lower()
+    if not (host.endswith(".supabase.co") or (lov_host and host == lov_host)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Host não permitido para importação: {host or '(vazio)'}. "
+                   "Use uma URL do Supabase Storage do projeto."
+        )
+
+
+@app.post("/api/erp/lotes/{lot_key}/documentos/importar")
+def importar_documento(
+    lot_key: str,
+    payload: ImportDocumentRequest,
+    user=Depends(get_current_user),
+):
+    lot = lovable_find_one(TABLE_LOTS, {"lot_key": lot_key})
+    if not lot:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+
+    source_url = clean_str(payload.source_url)
+    if not source_url:
+        raise HTTPException(status_code=400, detail="source_url é obrigatório.")
+    _validar_source_url(source_url)
+
+    original_name = clean_str(payload.original_file_name) or "documento.pdf"
+    ext = os.path.splitext(original_name)[1].lower() or ".pdf"
+    if ext not in IMPORT_EXTS_PERMITIDAS:
+        raise HTTPException(status_code=400, detail=f"Extensão não suportada: {ext}")
+
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    disk_path = os.path.join(UPLOAD_DIR, safe_name)
+
+    # Baixa o arquivo do Supabase Storage para o UPLOAD_DIR (com limite de tamanho).
+    try:
+        with _http_session.get(source_url, stream=True, timeout=120) as resp:
+            if resp.status_code >= 300:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Falha ao baixar o arquivo (status {resp.status_code})."
+                )
+            total = 0
+            with open(disk_path, "wb") as out:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > IMPORT_MAX_BYTES:
+                        out.close()
+                        if os.path.exists(disk_path):
+                            os.remove(disk_path)
+                        raise HTTPException(status_code=400, detail="Arquivo excede o limite de 60 MB.")
+                    out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if os.path.exists(disk_path):
+            os.remove(disk_path)
+        raise HTTPException(status_code=502, detail=f"Erro ao baixar o arquivo: {str(e)}")
+
+    file_size = os.path.getsize(disk_path)
+
+    doc_payload = {
+        "lot_key": lot_key,
+        "lot_id": lot.get("id"),
+        "erp_seqane": None,
+        "original_file_name": original_name,
+        "file_name": original_name,
+        "storage_path": disk_path,
+        "public_url": source_url,
+        "mime_type": _MIME_POR_EXT.get(ext, "application/octet-stream"),
+        "file_size": file_size,
+        "page_count": None,
+        "certificate_code": None,
+        "document_status": "UPLOADED",
+        "final_server_path": None,
+        "final_file_name": None,
+        "upload_source": "IMPORT",
+        "uploaded_by": clean_str(payload.uploaded_by) or user.get("sub"),
+        "uploaded_at": now_iso(),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    created_doc = lovable_insert(TABLE_DOCUMENTS, doc_payload)
+
+    lovable_insert(TABLE_ANALYSIS_JOBS, {
+        "document_id": created_doc.get("id"),
+        "lot_key": lot_key,
+        "job_type": "CERTIFICATE_EXTRACTION",
+        "job_status": "QUEUED",
+        "attempts": 0,
+        "error_message": None,
+        "started_at": None,
+        "finished_at": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    })
+
+    lovable_patch(TABLE_LOTS, {"lot_key": lot_key}, {
+        "status_app": "EM_ANALISE",
+        "updated_at": now_iso(),
+    })
+
+    return {
+        "ok": True,
+        "document_id": created_doc.get("id"),
+        "file_size": file_size,
+        "documento": created_doc,
+    }
 
 
 # =============================================================================

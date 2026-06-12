@@ -493,6 +493,28 @@ certificado e o status voltavam a ficar em branco (`build_lots_payload` mandava
 
 ---
 
+## 16. Importar documento do Supabase Storage (aprovar via API)
+
+Permite aprovar documentos que o front salvou no Supabase Storage (não só uploads locais).
+
+**Novo modelo + endpoint:**
+- `ImportDocumentRequest` (`lot_key`, `original_file_name`, `source_url`, `uploaded_by`)
+- `POST /api/erp/lotes/{lot_key}/documentos/importar`
+
+**Fluxo:** baixa o arquivo da `source_url` para `UPLOAD_DIR`, cria registro em `documents`
+(`upload_source=IMPORT`, `storage_path` local, `public_url=source_url`), enfileira
+`analysis_jobs`, marca o lote `EM_ANALISE` e retorna `document_id`. A tela usa esse
+`document_id` na aprovação (`/aprovar` ou `/aprovar-multiplos`).
+
+**Segurança:**
+- `_validar_source_url` bloqueia **SSRF**: só `https` e host do Supabase do projeto
+  (`*.supabase.co` ou host de `LOVABLE_DB_URL`). Bloqueia http, IPs internos, hosts externos.
+- Extensões permitidas (pdf/jpg/png/...) e **limite de 60 MB** (aborta e remove o parcial).
+
+> Validado: URLs Supabase https permitidas; http / 169.254.169.254 / host externo bloqueados.
+
+---
+
 ## Resumo de endpoints novos
 
 | Método | Rota |
@@ -507,6 +529,7 @@ certificado e o status voltavam a ficar em branco (`build_lots_payload` mandava
 | POST | `/api/erp/rastreabilidade-tintas` |
 | POST | `/api/erp/lista-conjuntos` |
 | GET | `/api/erp/certificados/lote/{codlot}/imagens` |
+| POST | `/api/erp/lotes/{lot_key}/documentos/importar` |
 
 ## SQL consolidado do Supabase (rodar tudo antes de re-sincronizar)
 
