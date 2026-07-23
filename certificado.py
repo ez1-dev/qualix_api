@@ -247,7 +247,82 @@ class ListaConjuntosRequest(BaseModel):
     data_final: Optional[str] = None
     codigo_barras: Optional[str] = None
     descricao_produto: Optional[str] = None
-    limit: int = 1000
+    limit: int = 50000
+    offset: int = 0
+
+
+# Origens (E075PRO.CODORI) que identificam matéria-prima no cadastro:
+# MPM (metálica), MPG (Genius), MPE (esquadrias), MPP (pré-moldados), MCP (civil).
+ORIGENS_MATERIA_PRIMA = ["MPM", "MPG", "MPE", "MPP", "MCP"]
+
+
+class RastreabilidadeItensComerciaisRequest(BaseModel):
+    # Itens COMPRADOS (E075PRO.TIPPRO='C') da Relação dos Elementos (USU_T900REE):
+    # parafusos/porcas/arruelas etc., separados dos conjuntos fabricados.
+    empresa: int = EMPRESA_PADRAO
+    obra: Optional[int] = None
+    desenho: Optional[int] = None
+    codigo_produto: Optional[str] = None
+    descricao_produto: Optional[str] = None
+    limit: int = 50000
+    offset: int = 0
+
+
+class ListaMateriaPrimaObraRequest(BaseModel):
+    empresa: int = EMPRESA_PADRAO
+    obra: Optional[int] = None
+    desenho: Optional[int] = None
+    op: Optional[int] = None
+    origem_op: Optional[str] = None
+    codigo_componente: Optional[str] = None
+    descricao_produto: Optional[str] = None
+    data_inicial: Optional[str] = None
+    data_final: Optional[str] = None
+    limit: int = 50000
+    offset: int = 0
+
+
+class ListaMateriaPrimaEntradaRequest(BaseModel):
+    empresa: int = EMPRESA_PADRAO
+    filial: Optional[int] = None
+    fornecedor: Optional[int] = None
+    nota_fiscal: Optional[int] = None
+    periodo_entrada: Optional[str] = None
+    data_inicial: Optional[str] = None
+    data_final: Optional[str] = None
+    origens: Optional[list[str]] = None
+    familia: Optional[str] = None
+    codigo_produto: Optional[str] = None
+    descricao_produto: Optional[str] = None
+    limit: int = 50000
+    offset: int = 0
+
+
+class ListaMateriaPrimaRequest(BaseModel):
+    """Payload unificado: o front manda `visao` conforme a escolha do usuário
+    e só os filtros da visão escolhida são considerados."""
+    visao: str = "OBRA"  # OBRA (USU_T900LCM) | ENTRADA (NF/USU_TLOTCAB)
+    empresa: int = EMPRESA_PADRAO
+    # Filtros da visão OBRA
+    obra: Optional[int] = None
+    desenho: Optional[int] = None
+    op: Optional[int] = None
+    origem_op: Optional[str] = None
+    codigo_componente: Optional[str] = None
+    # Filtros da visão ENTRADA
+    filial: Optional[int] = None
+    fornecedor: Optional[int] = None
+    nota_fiscal: Optional[int] = None
+    periodo_entrada: Optional[str] = None
+    origens: Optional[list[str]] = None
+    familia: Optional[str] = None
+    codigo_produto: Optional[str] = None
+    # Comuns
+    descricao_produto: Optional[str] = None
+    data_inicial: Optional[str] = None
+    data_final: Optional[str] = None
+    limit: int = 50000
+    offset: int = 0
 
 
 # =============================================================================
@@ -2412,29 +2487,28 @@ def query_rastreabilidade_materia_prima(payload: RastreabilidadeMateriaPrimaRequ
             ORDER BY SUB.USU_CODCMP
         ) SUBST
 
+        -- Posição no desenho = marca da peça (USU_T900QDO.USU_DESPEC). É dado
+        -- do DESENHO (projeto/desenho/revisão + matéria-prima), não da OP: em
+        -- USU_T900QDO o USU_NUMORP é apenas uma OP representativa (TOP 1 na
+        -- geração), então filtrar por CODORI/NUMORP zerava a posição das OPs
+        -- de origem Tekla (TKE/TKS/TKC). Resolve por QDO->MPR pelo desenho.
         OUTER APPLY (
-            SELECT
-                STRING_AGG(CONVERT(varchar(200), QDO.USU_DESPEC), ', ')
-                    WITHIN GROUP (ORDER BY QDO.USU_DESPEC) AS posicao_desenho
-            FROM USU_T900COP COP
-            INNER JOIN USU_T900QDO QDO
-                ON QDO.USU_CODEMP = COP.USU_CODEMP
-               AND QDO.USU_NUMPRJ = COP.USU_NUMPRJ
-               AND QDO.USU_NUMDES = COP.USU_NUMDES
-               AND QDO.USU_REVDES = COP.USU_REVDES
-               AND QDO.USU_SEQOPR = COP.USU_SEQOPR
-            INNER JOIN USU_T900MPR MPR
-                ON MPR.USU_CODEMP = COP.USU_CODEMP
-               AND MPR.USU_CODMPR = QDO.USU_CODMPR
-               AND MPR.USU_DERMPR = QDO.USU_DERMPR
-               AND MPR.USU_CODSEN = COALESCE(SUBST.codcmp_substituido, LCM.USU_CODCMP)
-               AND MPR.USU_DERSEN = COALESCE(SUBST.dercmp_substituido, LCM.USU_DERCMP)
-            WHERE COP.USU_CODEMP = LCM.USU_CODEMP
-              AND COP.USU_NUMPRJ = LCM.USU_NUMPRJ
-              AND COP.USU_NUMDES = LCM.USU_NUMDES
-              AND COP.USU_REVDES = LCM.USU_REVDES
-              AND COP.USU_CODORI = LCM.USU_CODORI
-              AND COP.USU_NUMORP = LCM.USU_NUMORP
+            SELECT STRING_AGG(P.USU_DESPEC, ', ')
+                       WITHIN GROUP (ORDER BY P.USU_DESPEC) AS posicao_desenho
+            FROM (
+                SELECT DISTINCT CONVERT(varchar(200), QDO.USU_DESPEC) AS USU_DESPEC
+                FROM USU_T900QDO QDO
+                INNER JOIN USU_T900MPR MPR
+                    ON MPR.USU_CODEMP = QDO.USU_CODEMP
+                   AND MPR.USU_CODMPR = QDO.USU_CODMPR
+                   AND MPR.USU_DERMPR = QDO.USU_DERMPR
+                   AND MPR.USU_CODSEN = COALESCE(SUBST.codcmp_substituido, LCM.USU_CODCMP)
+                   AND MPR.USU_DERSEN = COALESCE(SUBST.dercmp_substituido, LCM.USU_DERCMP)
+                WHERE QDO.USU_CODEMP = LCM.USU_CODEMP
+                  AND QDO.USU_NUMPRJ = LCM.USU_NUMPRJ
+                  AND QDO.USU_NUMDES = LCM.USU_NUMDES
+                  AND QDO.USU_REVDES = LCM.USU_REVDES
+            ) P
         ) POS
 
         WHERE LCM.USU_CODEMP = ?
@@ -3151,7 +3225,7 @@ def get_certificados_imagens_por_lote(
 # LISTA DE CONJUNTOS (RDCG208.GER / USU_T900ETQ)
 # =============================================================================
 
-def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]]:
+def query_lista_conjuntos(payload: ListaConjuntosRequest) -> tuple[list[dict[str, Any]], bool]:
     data_ini = parse_date_input(payload.data_inicial)
     data_fim = parse_date_input(payload.data_final)
 
@@ -3170,8 +3244,13 @@ def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]
             detail="Data inicial não pode ser maior que a data final."
         )
 
-    limit = int(payload.limit or 1000)
-    limit = max(1, min(limit, 5000))
+    # Teto alto: a sincronização "todas as obras" facilmente passa de 5000
+    # etiquetas por período (junho/2026 sozinho tem ~4100). Busca limit+1 para
+    # detectar truncamento e avisar o chamador em vez de cortar em silêncio.
+    # Períodos ainda maiores que o teto são pagináveis via offset.
+    limit = int(payload.limit or 50000)
+    limit = max(1, min(limit, 50000))
+    offset = max(0, int(payload.offset or 0))
 
     f_obra = payload.obra or None
     f_desenho = payload.desenho or None
@@ -3182,7 +3261,7 @@ def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]
     data_fim_excl = data_fim + timedelta(days=1)
 
     sql = f"""
-        SELECT TOP {limit}
+        SELECT
             ETQ.USU_CODEMP AS empresa,
             ETQ.USU_NUMPRJ AS obra,
             ETQ.USU_NUMDES AS desenho,
@@ -3243,14 +3322,18 @@ def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]
            AND PRJ.USU_NUMDES = ETQ.USU_NUMDES
            AND PRJ.USU_REVDES = ETQ.USU_REVDES
 
+        -- Última revisão = a que TEM etiqueta com entrada de estoque, e não a
+        -- última do cadastro (USU_T900PRJ). Quando a engenharia cria uma revisão
+        -- nova (ex.: B) mas os conjuntos ainda foram coletados na anterior (A),
+        -- usar a revisão do cadastro descartava 100% das etiquetas (desenho some
+        -- com Total=0). Aqui fazemos fallback para a revisão realmente coletada.
         OUTER APPLY (
-            SELECT TOP 1
-                   P.USU_REVDES AS ultima_revisao
-              FROM USU_T900PRJ P
-             WHERE P.USU_CODEMP = ETQ.USU_CODEMP
-               AND P.USU_NUMPRJ = ETQ.USU_NUMPRJ
-               AND P.USU_NUMDES = ETQ.USU_NUMDES
-             ORDER BY P.USU_REVDES DESC
+            SELECT MAX(E2.USU_REVDES) AS ultima_revisao
+              FROM USU_T900ETQ E2
+             WHERE E2.USU_CODEMP = ETQ.USU_CODEMP
+               AND E2.USU_NUMPRJ = ETQ.USU_NUMPRJ
+               AND E2.USU_NUMDES = ETQ.USU_NUMDES
+               AND E2.USU_USUENT > 0
         ) ULT
 
         WHERE ETQ.USU_CODEMP = ?
@@ -3271,7 +3354,10 @@ def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]
             ETQ.USU_NUMDES,
             ETQ.USU_REVDES,
             REE.USU_DESPRO,
-            ETQ.USU_CODBAR
+            ETQ.USU_CODBAR,
+            ETQ.USU_ITEREE,
+            ETQ.USU_ITEETQ
+        OFFSET {offset} ROWS FETCH NEXT {limit + 1} ROWS ONLY
     """
 
     params = [
@@ -3289,6 +3375,10 @@ def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = fetch_rows_dict(cur)
+
+        truncado = len(rows) > limit
+        if truncado:
+            rows = rows[:limit]
 
         for row in rows:
             row["data_entrada_br"] = format_date_br(row.get("data_entrada"))
@@ -3322,7 +3412,7 @@ def query_lista_conjuntos(payload: ListaConjuntosRequest) -> list[dict[str, Any]
             row["descricao_cadastro_produto"] = clean_str(row.get("descricao_cadastro_produto"))
             row["descricao_derivacao"] = clean_str(row.get("descricao_derivacao"))
 
-        return rows
+        return rows, truncado
     finally:
         conn.close()
 
@@ -3332,7 +3422,7 @@ def lista_conjuntos(
     payload: ListaConjuntosRequest,
     user=Depends(get_current_user),
 ):
-    dados = query_lista_conjuntos(payload)
+    dados, truncado = query_lista_conjuntos(payload)
 
     data_ini = parse_date_input(payload.data_inicial)
     data_fim = parse_date_input(payload.data_final)
@@ -3351,9 +3441,601 @@ def lista_conjuntos(
         "gerado_em": now_iso(),
     }
 
+    offset = max(0, int(payload.offset or 0))
     return {
         "ok": True,
         "total": len(dados),
+        "offset": offset,
+        "truncado": truncado,
+        "proximo_offset": (offset + len(dados)) if truncado else None,
+        "cabecalho": cabecalho,
+        "dados": dados,
+    }
+
+
+# =============================================================================
+# LISTA DE MATÉRIA-PRIMA
+# =============================================================================
+# A matéria-prima NÃO passa pelo coletor de etiquetas (USU_T900ETQ só tem
+# conjuntos, origens 100/TKC). Por isso a lista de MP tem duas visões:
+#   1) por obra/desenho (USU_T900LCM): qual MP foi aplicada em cada desenho/OP,
+#      com lote e certificados;
+#   2) por entrada de estoque (USU_TLOTCAB + E440): qual MP entrou por NF no
+#      período, com fornecedor, lote e certificados.
+
+def query_lista_materia_prima_obra(payload: ListaMateriaPrimaObraRequest) -> tuple[list[dict[str, Any]], bool]:
+    data_ini = parse_date_input(payload.data_inicial)
+    data_fim = parse_date_input(payload.data_final)
+    if (data_ini and not data_fim) or (data_fim and not data_ini):
+        raise HTTPException(
+            status_code=400,
+            detail="Informe data inicial e final juntas (ou nenhuma das duas)."
+        )
+    if data_ini and data_fim and data_ini > data_fim:
+        raise HTTPException(
+            status_code=400,
+            detail="Data inicial não pode ser maior que a data final."
+        )
+    data_fim_excl = (data_fim + timedelta(days=1)) if data_fim else None
+
+    limit = int(payload.limit or 50000)
+    limit = max(1, min(limit, 50000))
+    offset = max(0, int(payload.offset or 0))
+
+    f_obra = payload.obra or None
+    f_desenho = payload.desenho or None
+    f_op = payload.op or None
+    f_origem_op = clean_str(payload.origem_op) or None
+    f_codcmp = clean_str(payload.codigo_componente) or None
+    f_despro = clean_str(payload.descricao_produto) or None
+
+    sql = f"""
+        SELECT
+            LCM.USU_CODEMP AS empresa,
+            LCM.USU_NUMPRJ AS obra,
+            PRJ.NOMPRJ     AS nome_projeto,
+            LCM.USU_NUMDES AS desenho,
+            LCM.USU_REVDES AS revisao,
+            LCM.USU_CODORI AS origem_op,
+            LCM.USU_NUMORP AS op,
+
+            LCM.USU_CODCMP AS codigo_produto,
+            LCM.USU_DERCMP AS derivacao,
+            PRO.DESPRO     AS descricao_produto,
+            PRO.CODFAM     AS familia,
+            FAM.DESFAM     AS descricao_familia,
+            PRO.CODORI     AS origem_produto,
+
+            CAST(LCM.USU_CODLOT AS varchar(50)) AS lote,
+            LCM.USU_DATGER AS data_lancamento,
+
+            CERT.certificados     AS certificados,
+            CERT.qtd_certificados AS qtd_certificados
+
+        FROM USU_T900LCM LCM
+
+        LEFT JOIN E615PRJ PRJ
+            ON PRJ.CODEMP = LCM.USU_CODEMP
+           AND PRJ.NUMPRJ = LCM.USU_NUMPRJ
+
+        LEFT JOIN E075PRO PRO
+            ON PRO.CODEMP = LCM.USU_CODEMP
+           AND PRO.CODPRO = LCM.USU_CODCMP
+
+        LEFT JOIN E012FAM FAM
+            ON FAM.CODEMP = PRO.CODEMP
+           AND FAM.CODFAM = PRO.CODFAM
+
+        OUTER APPLY (
+            SELECT
+                STRING_AGG(CONVERT(varchar(100), A.USU_CODCER), ';') AS certificados,
+                COUNT(DISTINCT A.USU_CODCER) AS qtd_certificados
+            FROM USU_TLOTANE A
+            WHERE A.USU_CODEMP = LCM.USU_CODEMP
+              AND A.USU_CODLOT = TRY_CONVERT(bigint, LCM.USU_CODLOT)
+              AND ISNULL(LTRIM(RTRIM(A.USU_CODCER)), '') <> ''
+        ) CERT
+
+        WHERE LCM.USU_CODEMP = ?
+          AND (? IS NULL OR LCM.USU_NUMPRJ = ?)
+          AND (? IS NULL OR LCM.USU_NUMDES = ?)
+          AND (? IS NULL OR LCM.USU_NUMORP = ?)
+          AND (? IS NULL OR LCM.USU_CODORI = ?)
+          AND (? IS NULL OR LCM.USU_CODCMP = ?)
+          AND (? IS NULL OR UPPER(PRO.DESPRO) LIKE '%' + UPPER(?) + '%')
+          AND (? IS NULL OR LCM.USU_DATGER >= ?)
+          AND (? IS NULL OR LCM.USU_DATGER < ?)
+
+        ORDER BY
+            LCM.USU_NUMPRJ,
+            LCM.USU_NUMDES,
+            LCM.USU_REVDES,
+            LCM.USU_CODORI,
+            LCM.USU_NUMORP,
+            LCM.USU_CODCMP,
+            LCM.USU_CODLOT
+        OFFSET {offset} ROWS FETCH NEXT {limit + 1} ROWS ONLY
+    """
+
+    params = [
+        payload.empresa,
+        f_obra, f_obra,
+        f_desenho, f_desenho,
+        f_op, f_op,
+        f_origem_op, f_origem_op,
+        f_codcmp, f_codcmp,
+        f_despro, f_despro,
+        data_ini, data_ini,
+        data_fim_excl, data_fim_excl,
+    ]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = fetch_rows_dict(cur)
+
+        truncado = len(rows) > limit
+        if truncado:
+            rows = rows[:limit]
+
+        for row in rows:
+            row["data_lancamento_br"] = format_date_br(row.get("data_lancamento"))
+            row["produto"] = clean_str(row.get("codigo_produto"))
+            row["descricao"] = clean_str(row.get("descricao_produto"))
+            row["codigo_componente"] = clean_str(row.get("codigo_produto"))
+
+        return rows, truncado
+    finally:
+        conn.close()
+
+
+@app.post("/api/erp/lista-materia-prima-obra")
+def lista_materia_prima_obra(
+    payload: ListaMateriaPrimaObraRequest,
+    user=Depends(get_current_user),
+):
+    dados, truncado = query_lista_materia_prima_obra(payload)
+
+    cabecalho = {
+        "titulo": "Lista de Matéria-Prima por Obra",
+        "empresa": payload.empresa,
+        "obra": payload.obra,
+        "desenho": payload.desenho,
+        "op": payload.op,
+        "origem_op": clean_str(payload.origem_op),
+        "codigo_componente": clean_str(payload.codigo_componente),
+        "descricao_produto": clean_str(payload.descricao_produto),
+        "gerado_em": now_iso(),
+    }
+
+    offset = max(0, int(payload.offset or 0))
+    return {
+        "ok": True,
+        "total": len(dados),
+        "offset": offset,
+        "truncado": truncado,
+        "proximo_offset": (offset + len(dados)) if truncado else None,
+        "cabecalho": cabecalho,
+        "dados": dados,
+    }
+
+
+def query_lista_materia_prima_entrada(payload: ListaMateriaPrimaEntradaRequest) -> tuple[list[dict[str, Any]], bool]:
+    data_ini = parse_date_input(payload.data_inicial)
+    data_fim = parse_date_input(payload.data_final)
+
+    if payload.periodo_entrada and (not data_ini or not data_fim):
+        data_ini, data_fim = parse_periodo_entrada(payload.periodo_entrada)
+
+    if not data_ini or not data_fim:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe o período de entrada da nota fiscal."
+        )
+
+    if data_ini > data_fim:
+        raise HTTPException(
+            status_code=400,
+            detail="Data inicial não pode ser maior que a data final."
+        )
+
+    data_fim_excl = data_fim + timedelta(days=1)
+
+    limit = int(payload.limit or 50000)
+    limit = max(1, min(limit, 50000))
+    offset = max(0, int(payload.offset or 0))
+
+    origens = [clean_str(o).upper() for o in (payload.origens or ORIGENS_MATERIA_PRIMA) if clean_str(o)]
+    if not origens:
+        origens = list(ORIGENS_MATERIA_PRIMA)
+    origens_marks = ",".join("?" for _ in origens)
+
+    f_filial = payload.filial or None
+    f_fornecedor = payload.fornecedor or None
+    f_numnfc = payload.nota_fiscal or None
+    f_familia = clean_str(payload.familia) or None
+    f_codpro = clean_str(payload.codigo_produto) or None
+    f_despro = clean_str(payload.descricao_produto) or None
+
+    sql = f"""
+        SELECT
+            CAB.USU_CODEMP AS empresa,
+            CAB.USU_CODFIL AS filial,
+            CAB.USU_CODLOT AS lote,
+            CAB.USU_CODFOR AS fornecedor,
+            FORN.NOMFOR    AS nome_fornecedor,
+            CAB.USU_NUMNFC AS nota_fiscal,
+            CAB.USU_CODSNF AS serie,
+            NFC.DATENT     AS data_entrada,
+            IPC.NUMOCP     AS ordem_compra,
+
+            IPC.CODPRO     AS codigo_produto,
+            IPC.CODDER     AS derivacao,
+            PRO.DESPRO     AS descricao_produto,
+            IPC.CPLIPC     AS complemento_item,
+            PRO.CODFAM     AS familia,
+            FAM.DESFAM     AS descricao_familia,
+            PRO.CODORI     AS origem_produto,
+
+            IPC.QTDREC     AS quantidade_recebida,
+            IPC.UNIMED     AS unidade,
+            IPC.PESLIQ     AS peso_liquido,
+            ITE.USU_QTDITE AS quantidade_lote,
+
+            NULLIF(LTRIM(RTRIM(CONVERT(varchar(100), CAB.USU_CODCER))), '') AS certificado_lote,
+            CERT.certificados     AS certificados,
+            CERT.qtd_certificados AS qtd_certificados
+
+        FROM USU_TLOTCAB CAB
+
+        INNER JOIN USU_TLOTITE ITE
+            ON ITE.USU_CODEMP = CAB.USU_CODEMP
+           AND ITE.USU_CODLOT = CAB.USU_CODLOT
+
+        LEFT JOIN E440NFC NFC
+            ON NFC.CODEMP = CAB.USU_CODEMP
+           AND NFC.CODFIL = CAB.USU_CODFIL
+           AND NFC.CODFOR = CAB.USU_CODFOR
+           AND NFC.NUMNFC = CAB.USU_NUMNFC
+           AND NFC.CODSNF = CAB.USU_CODSNF
+
+        LEFT JOIN E440IPC IPC
+            ON IPC.CODEMP = ITE.USU_CODEMP
+           AND IPC.CODFIL = ITE.USU_CODFIL
+           AND IPC.CODFOR = ITE.USU_CODFOR
+           AND IPC.NUMNFC = ITE.USU_NUMNFC
+           AND IPC.CODSNF = ITE.USU_CODSNF
+           AND IPC.SEQIPC = ITE.USU_SEQIPC
+
+        LEFT JOIN E075PRO PRO
+            ON PRO.CODEMP = IPC.CODEMP
+           AND PRO.CODPRO = IPC.CODPRO
+
+        LEFT JOIN E012FAM FAM
+            ON FAM.CODEMP = PRO.CODEMP
+           AND FAM.CODFAM = PRO.CODFAM
+
+        LEFT JOIN E095FOR FORN
+            ON FORN.CODFOR = CAB.USU_CODFOR
+
+        OUTER APPLY (
+            SELECT
+                STRING_AGG(CONVERT(varchar(100), A.USU_CODCER), ';') AS certificados,
+                COUNT(DISTINCT A.USU_CODCER) AS qtd_certificados
+            FROM USU_TLOTANE A
+            WHERE A.USU_CODEMP = CAB.USU_CODEMP
+              AND A.USU_CODLOT = CAB.USU_CODLOT
+              AND ISNULL(LTRIM(RTRIM(A.USU_CODCER)), '') <> ''
+        ) CERT
+
+        WHERE CAB.USU_CODEMP = ?
+          AND (? IS NULL OR CAB.USU_CODFIL = ?)
+          AND (? IS NULL OR CAB.USU_CODFOR = ?)
+          AND (? IS NULL OR CAB.USU_NUMNFC = ?)
+          AND NFC.DATENT >= ?
+          AND NFC.DATENT < ?
+          AND UPPER(ISNULL(PRO.CODORI, '')) IN ({origens_marks})
+          AND (? IS NULL OR PRO.CODFAM = ?)
+          AND (? IS NULL OR IPC.CODPRO = ?)
+          AND (? IS NULL OR UPPER(PRO.DESPRO) LIKE '%' + UPPER(?) + '%')
+
+        ORDER BY
+            NFC.DATENT,
+            CAB.USU_CODFOR,
+            CAB.USU_NUMNFC,
+            CAB.USU_CODLOT,
+            ITE.USU_SEQIPC
+        OFFSET {offset} ROWS FETCH NEXT {limit + 1} ROWS ONLY
+    """
+
+    params = [
+        payload.empresa,
+        f_filial, f_filial,
+        f_fornecedor, f_fornecedor,
+        f_numnfc, f_numnfc,
+        data_ini,
+        data_fim_excl,
+        *origens,
+        f_familia, f_familia,
+        f_codpro, f_codpro,
+        f_despro, f_despro,
+    ]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = fetch_rows_dict(cur)
+
+        truncado = len(rows) > limit
+        if truncado:
+            rows = rows[:limit]
+
+        for row in rows:
+            row["data_entrada_br"] = format_date_br(row.get("data_entrada"))
+            row["produto"] = clean_str(row.get("codigo_produto"))
+            row["descricao"] = clean_str(row.get("descricao_produto"))
+            row["certificado_pendente"] = is_certificado_pendente(row.get("certificado_lote"))
+
+        return rows, truncado
+    finally:
+        conn.close()
+
+
+@app.post("/api/erp/lista-materia-prima-entrada")
+def lista_materia_prima_entrada(
+    payload: ListaMateriaPrimaEntradaRequest,
+    user=Depends(get_current_user),
+):
+    dados, truncado = query_lista_materia_prima_entrada(payload)
+
+    data_ini = parse_date_input(payload.data_inicial)
+    data_fim = parse_date_input(payload.data_final)
+    if payload.periodo_entrada and (not data_ini or not data_fim):
+        data_ini, data_fim = parse_periodo_entrada(payload.periodo_entrada)
+
+    cabecalho = {
+        "titulo": "Lista de Matéria-Prima por Entrada de Estoque",
+        "empresa": payload.empresa,
+        "filial": payload.filial,
+        "fornecedor": payload.fornecedor,
+        "nota_fiscal": payload.nota_fiscal,
+        "periodo_entrada": f"{format_date_br(data_ini)} até {format_date_br(data_fim)}",
+        "origens": [clean_str(o).upper() for o in (payload.origens or ORIGENS_MATERIA_PRIMA) if clean_str(o)],
+        "familia": clean_str(payload.familia),
+        "codigo_produto": clean_str(payload.codigo_produto),
+        "descricao_produto": clean_str(payload.descricao_produto),
+        "gerado_em": now_iso(),
+    }
+
+    offset = max(0, int(payload.offset or 0))
+    return {
+        "ok": True,
+        "total": len(dados),
+        "offset": offset,
+        "truncado": truncado,
+        "proximo_offset": (offset + len(dados)) if truncado else None,
+        "cabecalho": cabecalho,
+        "dados": dados,
+    }
+
+
+@app.post("/api/erp/lista-materia-prima")
+def lista_materia_prima(
+    payload: ListaMateriaPrimaRequest,
+    user=Depends(get_current_user),
+):
+    """Endpoint unificado: o seletor de visão do front decide a fonte.
+    visao=OBRA -> MP aplicada por obra/desenho (USU_T900LCM);
+    visao=ENTRADA -> MP por entrada de estoque via NF (USU_TLOTCAB/E440)."""
+    visao = clean_str(payload.visao).upper() or "OBRA"
+
+    if visao == "OBRA":
+        resultado = lista_materia_prima_obra(
+            ListaMateriaPrimaObraRequest(
+                empresa=payload.empresa,
+                obra=payload.obra,
+                desenho=payload.desenho,
+                op=payload.op,
+                origem_op=payload.origem_op,
+                codigo_componente=payload.codigo_componente,
+                descricao_produto=payload.descricao_produto,
+                data_inicial=payload.data_inicial,
+                data_final=payload.data_final,
+                limit=payload.limit,
+                offset=payload.offset,
+            ),
+            user=user,
+        )
+    elif visao == "ENTRADA":
+        resultado = lista_materia_prima_entrada(
+            ListaMateriaPrimaEntradaRequest(
+                empresa=payload.empresa,
+                filial=payload.filial,
+                fornecedor=payload.fornecedor,
+                nota_fiscal=payload.nota_fiscal,
+                periodo_entrada=payload.periodo_entrada,
+                data_inicial=payload.data_inicial,
+                data_final=payload.data_final,
+                origens=payload.origens,
+                familia=payload.familia,
+                codigo_produto=payload.codigo_produto,
+                descricao_produto=payload.descricao_produto,
+                limit=payload.limit,
+                offset=payload.offset,
+            ),
+            user=user,
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Visão inválida: {visao}. Use OBRA ou ENTRADA."
+        )
+
+    resultado["visao"] = visao
+    resultado["cabecalho"]["visao"] = visao
+    return resultado
+
+
+# =============================================================================
+# RASTREABILIDADE DE ITENS COMERCIAIS (USU_T900REE + E075PRO.TIPPRO='C')
+# =============================================================================
+# Página separada da Lista de Conjuntos: só os itens COMPRADOS
+# (E075PRO.TIPPRO='C' — parafusos/porcas/arruelas etc.) previstos na Relação
+# dos Elementos (USU_T900REE) da última revisão de cada desenho. Não passa por
+# entrada de estoque/etiqueta; usa a quantidade PREVISTA (USU_QTDPRO).
+
+def query_rastreabilidade_itens_comerciais(
+    payload: RastreabilidadeItensComerciaisRequest,
+) -> tuple[list[dict[str, Any]], bool]:
+    limit = int(payload.limit or 50000)
+    limit = max(1, min(limit, 50000))
+    offset = max(0, int(payload.offset or 0))
+
+    f_obra = payload.obra or None
+    f_desenho = payload.desenho or None
+    f_codpro = clean_str(payload.codigo_produto) or None
+    f_despro = clean_str(payload.descricao_produto) or None
+
+    sql = f"""
+        SELECT
+            REE.USU_CODEMP AS empresa,
+            REE.USU_NUMPRJ AS obra,
+            PRJ.NOMPRJ     AS nome_projeto,
+            REE.USU_NUMDES AS desenho,
+            REE.USU_REVDES AS revisao,
+            REE.USU_ITEREE AS item_ree,
+
+            REE.USU_CODPRO AS codigo_produto,
+            REE.USU_CODDER AS derivacao,
+            PRO.DESPRO     AS descricao_produto,
+            REE.USU_DESPRO AS descricao_ree,
+            PRO.CODFAM     AS familia,
+            FAM.DESFAM     AS descricao_familia,
+            PRO.TIPPRO     AS tipo_produto,
+            DER.DESDER     AS descricao_derivacao,
+
+            REE.USU_QTDPRO AS quantidade_prevista,
+            REE.USU_QTDEMB AS quantidade_embalagem,
+            REE.USU_QTDETQ AS quantidade_etiquetas,
+            REE.USU_PESREA AS peso_unitario,
+            CAST((ISNULL(REE.USU_QTDPRO, 0) * ISNULL(REE.USU_PESREA, 0)) AS DECIMAL(18, 2)) AS peso_total,
+
+            ULT.ultima_revisao AS ultima_revisao
+
+        FROM USU_T900REE REE
+
+        INNER JOIN E075PRO PRO
+            ON PRO.CODEMP = REE.USU_CODEMP
+           AND PRO.CODPRO = REE.USU_CODPRO
+
+        LEFT JOIN E012FAM FAM
+            ON FAM.CODEMP = PRO.CODEMP
+           AND FAM.CODFAM = PRO.CODFAM
+
+        LEFT JOIN E075DER DER
+            ON DER.CODEMP = REE.USU_CODEMP
+           AND DER.CODPRO = REE.USU_CODPRO
+           AND DER.CODDER = REE.USU_CODDER
+
+        LEFT JOIN E615PRJ PRJ
+            ON PRJ.CODEMP = REE.USU_CODEMP
+           AND PRJ.NUMPRJ = REE.USU_NUMPRJ
+
+        OUTER APPLY (
+            SELECT TOP 1 P.USU_REVDES AS ultima_revisao
+              FROM USU_T900PRJ P
+             WHERE P.USU_CODEMP = REE.USU_CODEMP
+               AND P.USU_NUMPRJ = REE.USU_NUMPRJ
+               AND P.USU_NUMDES = REE.USU_NUMDES
+             ORDER BY P.USU_REVDES DESC
+        ) ULT
+
+        WHERE REE.USU_CODEMP = ?
+          AND (? IS NULL OR REE.USU_NUMPRJ = ?)
+          AND (? IS NULL OR REE.USU_NUMDES = ?)
+          AND PRO.TIPPRO = 'C'
+          AND REE.USU_REVDES = ULT.ultima_revisao
+          AND (? IS NULL OR REE.USU_CODPRO = ?)
+          AND (? IS NULL OR UPPER(PRO.DESPRO) LIKE '%' + UPPER(?) + '%')
+
+        ORDER BY
+            REE.USU_NUMPRJ,
+            REE.USU_NUMDES,
+            REE.USU_REVDES,
+            PRO.DESPRO,
+            REE.USU_CODPRO,
+            REE.USU_ITEREE
+        OFFSET {offset} ROWS FETCH NEXT {limit + 1} ROWS ONLY
+    """
+
+    params = [
+        payload.empresa,
+        f_obra, f_obra,
+        f_desenho, f_desenho,
+        f_codpro, f_codpro,
+        f_despro, f_despro,
+    ]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = fetch_rows_dict(cur)
+
+        truncado = len(rows) > limit
+        if truncado:
+            rows = rows[:limit]
+
+        for row in rows:
+            # Descrição: o REE guarda só o código para itens comprados; a boa é
+            # a do cadastro (E075PRO.DESPRO).
+            desc = clean_str(row.get("descricao_produto")) or clean_str(row.get("descricao_ree"))
+            row["descricao_produto"] = desc
+            row["descricao"] = desc
+            row["descricao_cadastro_produto"] = clean_str(row.get("descricao_produto"))
+            row["descricao_ree"] = clean_str(row.get("descricao_ree"))
+            row["descricao_derivacao"] = clean_str(row.get("descricao_derivacao"))
+
+            # Aliases de compatibilidade com o front.
+            row["codigo"] = clean_str(row.get("codigo_produto"))
+            row["produto"] = clean_str(row.get("codigo_produto"))
+            row["codigo_componente"] = clean_str(row.get("codigo_produto"))
+            row["qtd_produto"] = row.get("quantidade_prevista")
+            row["qtd_prevista"] = row.get("quantidade_prevista")
+            row["qtd_embalagem"] = row.get("quantidade_embalagem")
+            row["qtd_etiquetas"] = row.get("quantidade_etiquetas")
+
+        return rows, truncado
+    finally:
+        conn.close()
+
+
+@app.post("/api/erp/rastreabilidade-itens-comerciais")
+def rastreabilidade_itens_comerciais(
+    payload: RastreabilidadeItensComerciaisRequest,
+    user=Depends(get_current_user),
+):
+    dados, truncado = query_rastreabilidade_itens_comerciais(payload)
+
+    nome_projeto = clean_str(dados[0].get("nome_projeto")) if dados else ""
+    obra = payload.obra or ""
+
+    cabecalho = {
+        "titulo": "RASTREABILIDADE DE ITENS COMERCIAIS",
+        "empresa": payload.empresa,
+        "obra": obra,
+        "desenho": payload.desenho,
+        "obra_cliente": f"{obra} | {nome_projeto}" if nome_projeto else clean_str(obra),
+        "somente_comprados": True,
+        "gerado_em": now_iso(),
+    }
+
+    return {
+        "ok": True,
+        "total": len(dados),
+        "truncado": truncado,
         "cabecalho": cabecalho,
         "dados": dados,
     }
