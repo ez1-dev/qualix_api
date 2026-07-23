@@ -268,6 +268,19 @@ class RastreabilidadeItensComerciaisRequest(BaseModel):
     offset: int = 0
 
 
+class ConjuntosCadastroRequest(BaseModel):
+    # Conjuntos FABRICADOS no cadastro do projeto (USU_T900REE, gerado pela
+    # tela W900PRJ), independente de entrada de estoque/etiqueta. Exclui
+    # comerciais (E075PRO.TIPPRO='C'). Última revisão de cada desenho.
+    empresa: int = EMPRESA_PADRAO
+    obra: Optional[int] = None
+    desenho: Optional[int] = None
+    codigo_produto: Optional[str] = None
+    descricao_produto: Optional[str] = None
+    limit: int = 50000
+    offset: int = 0
+
+
 class ListaMateriaPrimaObraRequest(BaseModel):
     empresa: int = EMPRESA_PADRAO
     obra: Optional[int] = None
@@ -4029,6 +4042,164 @@ def rastreabilidade_itens_comerciais(
         "desenho": payload.desenho,
         "obra_cliente": f"{obra} | {nome_projeto}" if nome_projeto else clean_str(obra),
         "somente_comprados": True,
+        "gerado_em": now_iso(),
+    }
+
+    return {
+        "ok": True,
+        "total": len(dados),
+        "truncado": truncado,
+        "cabecalho": cabecalho,
+        "dados": dados,
+    }
+
+
+# =============================================================================
+# CONJUNTOS NO CADASTRO DO PROJETO (USU_T900REE, W900PRJ) — sem estoque
+# =============================================================================
+# Busca conjuntos FABRICADOS direto no cadastro gerado pela tela W900PRJ
+# (USU_T900REE), independente de terem dado entrada no estoque/etiqueta.
+# Ao contrário da Lista de Conjuntos (que exige USU_T900ETQ + entrada +
+# período), aqui basta o item existir na REE. Última revisão de cada desenho,
+# exclui comerciais (E075PRO.TIPPRO='C').
+
+def query_conjuntos_cadastro(payload: ConjuntosCadastroRequest) -> tuple[list[dict[str, Any]], bool]:
+    limit = int(payload.limit or 50000)
+    limit = max(1, min(limit, 50000))
+    offset = max(0, int(payload.offset or 0))
+
+    f_obra = payload.obra or None
+    f_desenho = payload.desenho or None
+    f_codpro = clean_str(payload.codigo_produto) or None
+    f_despro = clean_str(payload.descricao_produto) or None
+
+    sql = f"""
+        SELECT
+            REE.USU_CODEMP AS empresa,
+            REE.USU_NUMPRJ AS obra,
+            PRJ.NOMPRJ     AS nome_projeto,
+            REE.USU_NUMDES AS desenho,
+            REE.USU_REVDES AS revisao,
+            REE.USU_ITEREE AS item_ree,
+
+            REE.USU_CODPRO AS codigo_produto,
+            REE.USU_CODDER AS derivacao,
+            REE.USU_DESPRO AS descricao_ree,
+            PRO.DESPRO     AS descricao_cadastro,
+            PRO.CODFAM     AS familia,
+            FAM.DESFAM     AS descricao_familia,
+            PRO.TIPPRO     AS tipo_produto,
+            NULLIF(LTRIM(RTRIM(CONVERT(varchar(100), REE.USU_BITPRO))), '') AS bitola,
+            NULLIF(LTRIM(RTRIM(CONVERT(varchar(100), REE.USU_DIMPRO))), '') AS dimensao,
+
+            REE.USU_QTDPRO AS quantidade_prevista,
+            REE.USU_QTDEMB AS quantidade_embalagem,
+            REE.USU_QTDETQ AS quantidade_etiquetas,
+            REE.USU_PESREA AS peso_unitario,
+            CAST((ISNULL(REE.USU_QTDPRO, 0) * ISNULL(REE.USU_PESREA, 0)) AS DECIMAL(18, 2)) AS peso_total,
+
+            ULT.ultima_revisao AS ultima_revisao
+
+        FROM USU_T900REE REE
+
+        INNER JOIN E075PRO PRO
+            ON PRO.CODEMP = REE.USU_CODEMP
+           AND PRO.CODPRO = REE.USU_CODPRO
+
+        LEFT JOIN E012FAM FAM
+            ON FAM.CODEMP = PRO.CODEMP
+           AND FAM.CODFAM = PRO.CODFAM
+
+        LEFT JOIN E615PRJ PRJ
+            ON PRJ.CODEMP = REE.USU_CODEMP
+           AND PRJ.NUMPRJ = REE.USU_NUMPRJ
+
+        OUTER APPLY (
+            SELECT TOP 1 P.USU_REVDES AS ultima_revisao
+              FROM USU_T900PRJ P
+             WHERE P.USU_CODEMP = REE.USU_CODEMP
+               AND P.USU_NUMPRJ = REE.USU_NUMPRJ
+               AND P.USU_NUMDES = REE.USU_NUMDES
+             ORDER BY P.USU_REVDES DESC
+        ) ULT
+
+        WHERE REE.USU_CODEMP = ?
+          AND (? IS NULL OR REE.USU_NUMPRJ = ?)
+          AND (? IS NULL OR REE.USU_NUMDES = ?)
+          AND (PRO.TIPPRO <> 'C' OR PRO.TIPPRO IS NULL)
+          AND REE.USU_REVDES = ULT.ultima_revisao
+          AND (? IS NULL OR REE.USU_CODPRO = ?)
+          AND (
+                ? IS NULL
+             OR UPPER(REE.USU_DESPRO) LIKE '%' + UPPER(?) + '%'
+             OR UPPER(PRO.DESPRO)     LIKE '%' + UPPER(?) + '%'
+          )
+
+        ORDER BY
+            REE.USU_NUMPRJ,
+            REE.USU_NUMDES,
+            REE.USU_REVDES,
+            REE.USU_DESPRO,
+            REE.USU_CODPRO,
+            REE.USU_ITEREE
+        OFFSET {offset} ROWS FETCH NEXT {limit + 1} ROWS ONLY
+    """
+
+    params = [
+        payload.empresa,
+        f_obra, f_obra,
+        f_desenho, f_desenho,
+        f_codpro, f_codpro,
+        f_despro, f_despro, f_despro,
+    ]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = fetch_rows_dict(cur)
+
+        truncado = len(rows) > limit
+        if truncado:
+            rows = rows[:limit]
+
+        for row in rows:
+            desc = clean_str(row.get("descricao_ree")) or clean_str(row.get("descricao_cadastro"))
+            row["descricao_produto"] = desc
+            row["descricao"] = desc
+            row["descricao_cadastro"] = clean_str(row.get("descricao_cadastro"))
+            row["descricao_ree"] = clean_str(row.get("descricao_ree"))
+            row["bitola"] = clean_str(row.get("bitola"))
+            row["dimensao"] = clean_str(row.get("dimensao"))
+
+            row["codigo"] = clean_str(row.get("codigo_produto"))
+            row["produto"] = clean_str(row.get("codigo_produto"))
+            row["qtd_produto"] = row.get("quantidade_prevista")
+            row["qtd_prevista"] = row.get("quantidade_prevista")
+            row["qtd_etiquetas"] = row.get("quantidade_etiquetas")
+
+        return rows, truncado
+    finally:
+        conn.close()
+
+
+@app.post("/api/erp/conjuntos-cadastro")
+def conjuntos_cadastro(
+    payload: ConjuntosCadastroRequest,
+    user=Depends(get_current_user),
+):
+    dados, truncado = query_conjuntos_cadastro(payload)
+
+    nome_projeto = clean_str(dados[0].get("nome_projeto")) if dados else ""
+    obra = payload.obra or ""
+
+    cabecalho = {
+        "titulo": "CONJUNTOS NO CADASTRO DO PROJETO",
+        "empresa": payload.empresa,
+        "obra": obra,
+        "desenho": payload.desenho,
+        "obra_cliente": f"{obra} | {nome_projeto}" if nome_projeto else clean_str(obra),
+        "fonte": "USU_T900REE (W900PRJ) - independente de estoque",
         "gerado_em": now_iso(),
     }
 
