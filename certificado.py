@@ -4073,31 +4073,48 @@ def query_conjuntos_cadastro(payload: ConjuntosCadastroRequest) -> tuple[list[di
     f_codpro = clean_str(payload.codigo_produto) or None
     f_despro = clean_str(payload.descricao_produto) or None
 
+    # REE é a base (cadastro do projeto); a etiqueta (ETQ) entra por LEFT JOIN:
+    # se o conjunto tiver etiqueta, traz código de barras / entrada; se não
+    # tiver (nunca deu entrada), o conjunto ainda aparece com esses campos vazios.
     sql = f"""
         SELECT
             REE.USU_CODEMP AS empresa,
             REE.USU_NUMPRJ AS obra,
-            PRJ.NOMPRJ     AS nome_projeto,
+            PRJC.NOMPRJ    AS nome_projeto,
             REE.USU_NUMDES AS desenho,
             REE.USU_REVDES AS revisao,
+
             REE.USU_ITEREE AS item_ree,
+            ETQ.USU_ITEETQ AS item_etiqueta,
+            ETQ.USU_CODBAR AS codigo_barras,
+
+            ETQ.USU_QTDPRO AS quantidade_produto,
+            ETQ.USU_USUENT AS usuario_entrada,
+            ETQ.USU_DATENT AS data_entrada,
+            ETQ.USU_HORENT AS hora_entrada,
 
             REE.USU_CODPRO AS codigo_produto,
             REE.USU_CODDER AS derivacao,
             REE.USU_DESPRO AS descricao_ree,
-            PRO.DESPRO     AS descricao_cadastro,
-            PRO.CODFAM     AS familia,
-            FAM.DESFAM     AS descricao_familia,
-            PRO.TIPPRO     AS tipo_produto,
             NULLIF(LTRIM(RTRIM(CONVERT(varchar(100), REE.USU_BITPRO))), '') AS bitola,
             NULLIF(LTRIM(RTRIM(CONVERT(varchar(100), REE.USU_DIMPRO))), '') AS dimensao,
+
+            PRO.DESPRO AS descricao_cadastro_produto,
+            PRO.DATGER AS data_geracao_cadastro_produto,
+            PRO.HORGER AS hora_geracao_cadastro_produto,
+            PRO.USUGER AS usuario_geracao_cadastro_produto,
+            PRO.CODFAM AS familia,
+            FAM.DESFAM AS descricao_familia,
+            PRO.TIPPRO AS tipo_produto,
+            DER.DESDER AS descricao_derivacao,
 
             REE.USU_QTDPRO AS quantidade_prevista,
             REE.USU_QTDEMB AS quantidade_embalagem,
             REE.USU_QTDETQ AS quantidade_etiquetas,
-            REE.USU_PESREA AS peso_unitario,
-            CAST((ISNULL(REE.USU_QTDPRO, 0) * ISNULL(REE.USU_PESREA, 0)) AS DECIMAL(18, 2)) AS peso_total,
+            REE.USU_PESREA AS peso_real,
+            CAST((ISNULL(ETQ.USU_QTDPRO, 0) * ISNULL(REE.USU_PESREA, 0)) AS DECIMAL(18, 2)) AS peso_total,
 
+            PRJD.USU_DESPRJ AS descricao_projeto,
             ULT.ultima_revisao AS ultima_revisao
 
         FROM USU_T900REE REE
@@ -4106,13 +4123,31 @@ def query_conjuntos_cadastro(payload: ConjuntosCadastroRequest) -> tuple[list[di
             ON PRO.CODEMP = REE.USU_CODEMP
            AND PRO.CODPRO = REE.USU_CODPRO
 
+        LEFT JOIN USU_T900ETQ ETQ
+            ON ETQ.USU_CODEMP = REE.USU_CODEMP
+           AND ETQ.USU_NUMPRJ = REE.USU_NUMPRJ
+           AND ETQ.USU_NUMDES = REE.USU_NUMDES
+           AND ETQ.USU_REVDES = REE.USU_REVDES
+           AND ETQ.USU_ITEREE = REE.USU_ITEREE
+
         LEFT JOIN E012FAM FAM
             ON FAM.CODEMP = PRO.CODEMP
            AND FAM.CODFAM = PRO.CODFAM
 
-        LEFT JOIN E615PRJ PRJ
-            ON PRJ.CODEMP = REE.USU_CODEMP
-           AND PRJ.NUMPRJ = REE.USU_NUMPRJ
+        LEFT JOIN E075DER DER
+            ON DER.CODEMP = REE.USU_CODEMP
+           AND DER.CODPRO = REE.USU_CODPRO
+           AND DER.CODDER = REE.USU_CODDER
+
+        LEFT JOIN E615PRJ PRJC
+            ON PRJC.CODEMP = REE.USU_CODEMP
+           AND PRJC.NUMPRJ = REE.USU_NUMPRJ
+
+        LEFT JOIN USU_T900PRJ PRJD
+            ON PRJD.USU_CODEMP = REE.USU_CODEMP
+           AND PRJD.USU_NUMPRJ = REE.USU_NUMPRJ
+           AND PRJD.USU_NUMDES = REE.USU_NUMDES
+           AND PRJD.USU_REVDES = REE.USU_REVDES
 
         OUTER APPLY (
             SELECT TOP 1 P.USU_REVDES AS ultima_revisao
@@ -4141,7 +4176,8 @@ def query_conjuntos_cadastro(payload: ConjuntosCadastroRequest) -> tuple[list[di
             REE.USU_REVDES,
             REE.USU_DESPRO,
             REE.USU_CODPRO,
-            REE.USU_ITEREE
+            REE.USU_ITEREE,
+            ETQ.USU_ITEETQ
         OFFSET {offset} ROWS FETCH NEXT {limit + 1} ROWS ONLY
     """
 
@@ -4164,19 +4200,35 @@ def query_conjuntos_cadastro(payload: ConjuntosCadastroRequest) -> tuple[list[di
             rows = rows[:limit]
 
         for row in rows:
-            desc = clean_str(row.get("descricao_ree")) or clean_str(row.get("descricao_cadastro"))
+            # Datas/horas de entrada da etiqueta (vazias se sem etiqueta).
+            row["data_entrada_br"] = format_date_br(row.get("data_entrada"))
+            row["hora_entrada_br"] = format_hora_senior(row.get("hora_entrada"))
+
+            # Data/hora de geração do cadastro do produto (E075PRO).
+            row["data_geracao_cadastro_produto_br"] = format_date_br(row.get("data_geracao_cadastro_produto"))
+            row["hora_geracao_cadastro_produto_br"] = format_hora_senior(row.get("hora_geracao_cadastro_produto"))
+            row["product_created_date"] = row["data_geracao_cadastro_produto_br"]
+            row["product_created_at"] = row["data_geracao_cadastro_produto_br"]
+
+            # Descrição: REE.USU_DESPRO, com fallback pro cadastro (E075PRO).
+            desc = clean_str(row.get("descricao_ree")) or clean_str(row.get("descricao_cadastro_produto"))
             row["descricao_produto"] = desc
             row["descricao"] = desc
-            row["descricao_cadastro"] = clean_str(row.get("descricao_cadastro"))
             row["descricao_ree"] = clean_str(row.get("descricao_ree"))
+            row["descricao_cadastro_produto"] = clean_str(row.get("descricao_cadastro_produto"))
+            row["descricao_derivacao"] = clean_str(row.get("descricao_derivacao"))
+
             row["bitola"] = clean_str(row.get("bitola"))
             row["dimensao"] = clean_str(row.get("dimensao"))
 
-            row["codigo"] = clean_str(row.get("codigo_produto"))
+            # Aliases de compatibilidade (mesmos nomes da Lista de Conjuntos).
+            row["codigo"] = clean_str(row.get("codigo_barras"))
             row["produto"] = clean_str(row.get("codigo_produto"))
-            row["qtd_produto"] = row.get("quantidade_prevista")
+            row["qtd_produto"] = row.get("quantidade_produto")
             row["qtd_prevista"] = row.get("quantidade_prevista")
+            row["qtd_embalagem"] = row.get("quantidade_embalagem")
             row["qtd_etiquetas"] = row.get("quantidade_etiquetas")
+            row["tem_etiqueta"] = bool(clean_str(row.get("codigo_barras")))
 
         return rows, truncado
     finally:
