@@ -4290,6 +4290,18 @@ def debug_lovable(user=Depends(get_current_user)):
 
 
 # =============================================================================
+# EXTENSÃO: lotes por OP / lote -> OPs / modelo de produto (rastreabilidade_op.py)
+# =============================================================================
+import rastreabilidade_op  # noqa: E402
+rastreabilidade_op.configurar(
+    get_connection=get_connection, get_current_user=get_current_user, fetch_rows_dict=fetch_rows_dict,
+    clean_str=clean_str, format_date_br=format_date_br,
+    buscar_anexos_certificados_por_lotes=buscar_anexos_certificados_por_lotes, empresa_padrao=EMPRESA_PADRAO,
+)
+app.include_router(rastreabilidade_op.router)
+
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
 

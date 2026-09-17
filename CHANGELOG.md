@@ -515,6 +515,51 @@ Permite aprovar documentos que o front salvou no Supabase Storage (não só uplo
 
 ---
 
+---
+
+## 17. Lotes por OP, lote → OPs e Modelo de produto (`rastreabilidade_op.py`)
+
+Extensão em **arquivo separado**, ligada ao `certificado.py` por um bloco de 3 comandos antes
+do ENTRY POINT (`import rastreabilidade_op` → `configurar(...)` → `app.include_router`). Os
+helpers do host chegam por `configurar()` para não criar ciclo de importação. Somente leitura.
+
+**Endpoints novos (GET, Bearer):**
+- `GET /api/erp/ordens-producao/{origem}/{op}/lotes?empresa=1&listar_imagens_certificados=S`
+  OP → lotes de matéria-prima: cabeçalho da OP (E900COP), `resumo` de cobertura e uma linha
+  por vínculo componente × lote (`USU_T900LCM`) com NF (`USU_TLOTCAB`/`E440NFC`: número, série,
+  entrada, **chave NF-e**), fornecedor (`E095FOR`), certificado, `itens_nf` (`USU_TLOTITE`/`E440IPC`)
+  e imagens via `buscar_anexos_certificados_por_lotes` (`certificados_imagens[].arquivo_url`).
+- `GET /api/erp/lotes/{codlot}/ordens-producao` — inverso (recall): cabeçalho do lote + OPs que o
+  consumiram (obra, desenho, revisão, produto da OP, situação).
+- `GET /api/erp/produtos/{codpro}/modelo` — `E075PRO.CODMOD → E700MOD`: capa, roteiro (`E710ROT`),
+  família, derivações (`E700DMO`), histórico (`E700VMO`), contagens (`E700CMM`).
+- `GET /api/erp/modelos?q=&familia=&mascara_derivacao=&situacao=&limit=&offset=` — busca paginada
+  (`q` ignora acento; `truncado`/`proximo_offset` como nas listas).
+- `GET /api/erp/modelos/{codmod}` — detalhe.
+
+**Regras:**
+- **Não** bloqueia a origem `100` (diferente da impressão de OP): a rastreabilidade de aço
+  vive nas origens `100`/`TKE`.
+- OP existente sem apontamento → **200** com `dados=[]` (cobertura zero é informação). 404 só
+  quando a OP/lote/produto/modelo não existe. Erros de parâmetro → 400 (padrão desta API).
+- Um componente pode ter vários lotes (há casos com 11): uma linha por vínculo. Vínculo apontado
+  sem lote vem com `lote=""` e `lote_cadastrado=false`.
+- Lote apontado mas sem cabeçalho em `USU_TLOTCAB` (1 caso no histórico, digitado errado):
+  `lote_cadastrado=false`, OPs devolvidas mesmo assim.
+- Produto sem modelo (chapa/cantoneira comprada) → 200 com `possui_modelo=false` + `aviso`.
+- `listar_imagens_certificados=N` pula a consulta de anexos (mais rápido).
+
+**Validado (15/09/2026):** 24 chamadas HTTP em instância local (login ADMIN, banco real):
+OP 100/66038 (L010 → lote 25001149 → NF 1911994 Gerdau → cert 8186016922/000010 + imagem),
+OP 100/66025 (7 vínculos, 3 sem lote), OP 210/88447 (sem apontamento), lote órfão, produtos
+250001093 / CHA016 / 200000281, busca "gata 120" PLANT com paginação. Rotas antigas
+(`rastreabilidade-materia-prima`, `certificados/lote/{codlot}/imagens`) inalteradas.
+Cobertura do apontamento em 2026: TKE 8.105/16.603 OPs com lote, origem 100 286/738, TKC/TKS 0.
+
+> Compatível com Python 3.10 (Linux) e 3.14 (Windows). Não usa Supabase.
+
+---
+
 ## Resumo de endpoints novos
 
 | Método | Rota |
@@ -530,6 +575,11 @@ Permite aprovar documentos que o front salvou no Supabase Storage (não só uplo
 | POST | `/api/erp/lista-conjuntos` |
 | GET | `/api/erp/certificados/lote/{codlot}/imagens` |
 | POST | `/api/erp/lotes/{lot_key}/documentos/importar` |
+| GET | `/api/erp/ordens-producao/{origem}/{op}/lotes` |
+| GET | `/api/erp/lotes/{codlot}/ordens-producao` |
+| GET | `/api/erp/produtos/{codpro}/modelo` |
+| GET | `/api/erp/modelos` |
+| GET | `/api/erp/modelos/{codmod}` |
 
 ## SQL consolidado do Supabase (rodar tudo antes de re-sincronizar)
 
