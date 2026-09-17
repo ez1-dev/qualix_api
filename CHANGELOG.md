@@ -560,6 +560,40 @@ Cobertura do apontamento em 2026: TKE 8.105/16.603 OPs com lote, origem 100 286/
 
 ---
 
+## 18. Conjunto → peças → OPs → lotes; desenho completo; conjuntos na rota da OP
+
+Continuação da seção 17, no mesmo `rastreabilidade_op.py`. Somente leitura. Cadeia validada no banco:
+
+- **Tekla (TKE/TKC):** 1 OP TKE = 1 **peça** (`E900COP.CODPRO` = marca, ex. `6701013-W16`); 1 OP TKC = 1
+  **conjunto** (ex. `6701013-PT1`). A composição **peça → conjunto está no modelo de engenharia**
+  (`E700CMM.CODMOD` = conjunto, `CODCMP` = peça; quantidade em `E700CTM.QTDUTI`). Lote do aço fica na OP
+  da peça (`USU_T900LCM`); a OP do conjunto não tem apontamento próprio.
+- **Desenho manual (origem 100):** 1 OP = 1 **operação** do desenho (`USU_T900COP.USU_SEQOPR`, ex. "cortar
+  cantoneiras"); as peças cortadas estão em `USU_T900QDO` (marca, matéria-prima via `USU_T900MPR`). Os conjuntos
+  (`USU_T900REE`) **não têm modelo** → composição peça → conjunto não existe no ERP para origem 100.
+
+**Rotas novas (GET, Bearer):**
+- `GET /api/erp/conjuntos/{codigo}/rastreabilidade?listar_imagens_certificados=N` — conjunto (produto +
+  obra/desenho/revisão da relação de elementos + `ops_conjunto` TKC) → `dados[]` = peças do modelo, cada uma
+  com `ops[]` (OP da peça) e `materiais[]` (mesma linha da rota da OP: lote, NF, fornecedor, certificado, imagens).
+  Conjunto sem modelo → 200 com `dados=[]` + `aviso`. 404 se não existe nem como produto nem como modelo.
+- `GET /api/erp/desenhos/{obra}/{desenho}/{revisao}/rastreabilidade` — todos os conjuntos fabricados do desenho
+  (`USU_T900REE` com `TIPPRO<>'C'`), cada um com `ops_conjunto` e `pecas[]` (mesmo formato acima). Itens comerciais
+  ficam com `/api/erp/rastreabilidade-itens-comerciais`. Consultas em lote (`VALUES`/`IN` com chunk de 400) — sem N+1.
+
+**Rota alterada (compatível):** `GET /api/erp/ordens-producao/{origem}/{op}/lotes?incluir_conjuntos=S` acrescenta
+ao `cabecalho`: `conjuntos[]` (em quais conjuntos a peça entra + OPs TKC + obra/desenho), `operacao` (origem 100:
+obra, desenho, revisão, seq/descrição da operação) e `pecas_operacao[]` (marcas cortadas, matéria-prima,
+`codigo_materia_prima`, dimensões, kg). Sem o parâmetro a resposta é idêntica à seção 17.
+
+**Validado (17/09/2026, instância local, banco real):** OP TKE 15975 → conjunto PT1 (OP TKC 5260, obra 670
+"PIER FLUTUANTE"); OP 100/66038 → operação 20 "CORTAR CANTONEIRAS" com 5 peças (L010/L016); conjunto PT1 → 16
+peças, 15 com OP, W16 com lote 25000530 (NF 3236475 Gerdau Ouro Branco, cert 817711293/0000020, 2 imagens);
+desenho 670/1013/A → 25 conjuntos, 24 com modelo, 123 peças; desenho 655/2462/A (manual) → 16 conjuntos sem modelo;
+404 para conjunto/desenho inexistentes; rotas anteriores e `rastreabilidade-materia-prima` inalteradas.
+
+---
+
 ## Resumo de endpoints novos
 
 | Método | Rota |
@@ -580,6 +614,8 @@ Cobertura do apontamento em 2026: TKE 8.105/16.603 OPs com lote, origem 100 286/
 | GET | `/api/erp/produtos/{codpro}/modelo` |
 | GET | `/api/erp/modelos` |
 | GET | `/api/erp/modelos/{codmod}` |
+| GET | `/api/erp/conjuntos/{codigo}/rastreabilidade` |
+| GET | `/api/erp/desenhos/{obra}/{desenho}/{revisao}/rastreabilidade` |
 
 ## SQL consolidado do Supabase (rodar tudo antes de re-sincronizar)
 

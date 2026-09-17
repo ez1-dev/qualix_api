@@ -16,7 +16,10 @@ Os helpers chegam por configurar() (não por import) para não criar ciclo de
 importação com o certificado.py. Rotas:
 
     GET /api/erp/ordens-producao/{origem}/{op}/lotes      OP -> lotes (NF, fornecedor, certificado, imagens)
+                                                         ?incluir_conjuntos=S: conjuntos da peça / peças da operação
     GET /api/erp/lotes/{codlot}/ordens-producao          lote -> OPs (recall / auditoria)
+    GET /api/erp/conjuntos/{codigo}/rastreabilidade      conjunto -> peças (E700CMM) -> OP da peça -> lotes
+    GET /api/erp/desenhos/{obra}/{desenho}/{rev}/rastreabilidade  desenho -> conjuntos -> peças -> OPs -> lotes
     GET /api/erp/produtos/{codpro}/modelo                modelo do produto (E075PRO.CODMOD -> E700MOD)
     GET /api/erp/modelos                                 busca paginada de modelos
     GET /api/erp/modelos/{codmod}                        detalhe do modelo
@@ -192,6 +195,209 @@ _CAMPOS_LOTE_VAZIOS = {
 }
 
 
+def _linha_material(v: dict[str, Any], lotes: dict[str, dict[str, Any]], listar_imagens: bool) -> dict[str, Any]:
+    """Linha de vínculo (USU_T900LCM) + detalhe do lote (ou campos vazios quando sem lote/sem cadastro)."""
+    lote = _clean(v.get("lote"))
+    detalhe = lotes.get(lote) if lote else None
+    linha = {**v, "lote": lote, "data_lancamento_br": _data_br(v.get("data_lancamento")),
+             "lote_cadastrado": detalhe is not None,
+             "produto": v.get("codigo_componente", ""), "descricao": v.get("descricao_produto", "")}
+    if detalhe is not None:
+        linha.update(detalhe)
+    else:
+        linha.update(_CAMPOS_LOTE_VAZIOS)
+        if listar_imagens:
+            linha.update({"qtd_imagens_certificados": 0, "certificados_imagens": [], "certificados_detalhe": []})
+    return linha
+
+
+def _resumo_materiais(dados: list[dict[str, Any]]) -> dict[str, int]:
+    com_lote = [d for d in dados if d.get("lote")]
+    return {
+        "vinculos": len(dados),
+        "com_lote": len(com_lote),
+        "sem_lote": len(dados) - len(com_lote),
+        "lotes_distintos": len({d["lote"] for d in com_lote}),
+        "lotes_sem_cadastro": len({d["lote"] for d in com_lote if not d.get("lote_cadastrado")}),
+        "fornecedores_distintos": len({d["fornecedor"] for d in com_lote if d.get("fornecedor")}),
+        "componentes_distintos": len({d.get("codigo_componente") for d in dados}),
+    }
+
+
+def _chunks(seq: list, n: int = 400):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+_SQL_VINCULOS_BASE = """
+    SELECT
+        LCM.USU_CODORI                   AS origem_op,
+        LCM.USU_NUMORP                   AS op,
+        LCM.USU_SEQ                      AS seq,
+        LCM.USU_CODETG                   AS etapa,
+        LCM.USU_SEQCMP                   AS seq_componente,
+        COALESCE(LCM.USU_CODCMP, '')     AS codigo_componente,
+        COALESCE(LCM.USU_DERCMP, '')     AS derivacao,
+        COALESCE(PRO.DESPRO, '')         AS descricao_produto,
+        COALESCE(PRO.CODFAM, '')         AS familia,
+        COALESCE(FAM.DESFAM, '')         AS descricao_familia,
+        COALESCE(LCM.USU_CMPSBS, '')     AS componente_substituto,
+        COALESCE(LCM.USU_DERSBS, '')     AS derivacao_substituto,
+        LTRIM(RTRIM(COALESCE(LCM.USU_CODLOT, ''))) AS lote,
+        LCM.USU_NUMPRJ                   AS obra,
+        LCM.USU_NUMDES                   AS desenho,
+        COALESCE(LCM.USU_REVDES, '')     AS revisao,
+        LCM.USU_DATGER                   AS data_lancamento,
+        LCM.USU_USUGER                   AS usuario_lancamento
+    FROM USU_T900LCM LCM
+    LEFT JOIN E075PRO PRO ON PRO.CODEMP = LCM.USU_CODEMP AND PRO.CODPRO = LCM.USU_CODCMP
+    LEFT JOIN E012FAM FAM ON FAM.CODEMP = PRO.CODEMP AND FAM.CODFAM = PRO.CODFAM
+"""
+
+
+def _materiais_por_ops(cur, codemp: int, ops: list[tuple[str, int]], listar_imagens: bool) -> dict[tuple[str, int], list[dict[str, Any]]]:
+    """Vínculos de lote de várias OPs (uma query por lote de 400 OPs) + detalhe dos lotes em uma passada."""
+    pares = sorted({(_clean(o), int(n)) for o, n in ops if _clean(o) and n})
+    if not pares:
+        return {}
+    vinculos: list[dict[str, Any]] = []
+    for parte in _chunks(pares):
+        valores = ",".join("(?,?)" for _ in parte)
+        params: list[Any] = [codemp]
+        for o, n in parte:
+            params += [o, n]
+        cur.execute(
+            _SQL_VINCULOS_BASE
+            + f" JOIN (VALUES {valores}) V(ORI, NUM) ON V.ORI = LCM.USU_CODORI AND V.NUM = LCM.USU_NUMORP"
+            + " WHERE LCM.USU_CODEMP = ? ORDER BY LCM.USU_NUMORP, LCM.USU_SEQ, LCM.USU_CODLOT",
+            [*params[1:], codemp],
+        )
+        vinculos.extend(_rows(cur))
+    lotes = _carregar_lotes(cur, codemp, [v["lote"] for v in vinculos if v["lote"]], listar_imagens)
+    saida: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for v in vinculos:
+        chave = (_clean(v.get("origem_op")), int(v.get("op") or 0))
+        saida.setdefault(chave, []).append(_linha_material(v, lotes, listar_imagens))
+    return saida
+
+
+def _ops_por_produto(cur, codemp: int, codpros: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """OPs (E900COP) cujo produto é cada código informado — peças (TKE) ou conjuntos (TKC)."""
+    codigos = sorted({_clean(c) for c in codpros if _clean(c)})
+    saida: dict[str, list[dict[str, Any]]] = {}
+    for parte in _chunks(codigos):
+        marcas = ",".join("?" for _ in parte)
+        cur.execute(
+            f"""
+            SELECT E.CODPRO AS codigo_produto, E.CODORI AS origem_op, E.NUMORP AS op,
+                   COALESCE(E.SITORP, '') AS situacao, COALESCE(E.TIPORP, '') AS tipo_op,
+                   E.DATGER AS data_geracao, E.DTRINI AS real_inicio, E.DTRFIM AS real_fim,
+                   E.QTDPRV AS quantidade_prevista, E.QTDRE1 AS quantidade_realizada
+            FROM E900COP E
+            WHERE E.CODEMP = ? AND E.CODPRO IN ({marcas})
+            ORDER BY E.CODPRO, E.NUMORP
+            """,
+            [codemp, *parte],
+        )
+        for o in _rows(cur):
+            o["situacao_descricao"] = SITUACAO_OP.get(o["situacao"], o["situacao"])
+            o["data_geracao_br"] = _data_br(o.get("data_geracao"))
+            o["real_fim_br"] = _data_br(o.get("real_fim"))
+            saida.setdefault(_clean(o.pop("codigo_produto")), []).append(o)
+    return saida
+
+
+def _pecas_dos_modelos(cur, codemp: int, codmods: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Peças (componentes) de cada modelo de conjunto — E700CMM + quantidade em E700CTM."""
+    modelos = sorted({_clean(m) for m in codmods if _clean(m)})
+    saida: dict[str, list[dict[str, Any]]] = {}
+    for parte in _chunks(modelos):
+        marcas = ",".join("?" for _ in parte)
+        cur.execute(
+            f"""
+            SELECT C.CODMOD AS modelo, C.CODETG AS etapa, C.SEQMOD AS seq,
+                   C.CODCMP AS peca, COALESCE(C.DESCMP, '') AS descricao,
+                   COALESCE(P.DESPRO, '') AS descricao_cadastro, COALESCE(P.TIPPRO, '') AS tipo_produto,
+                   CT.QTDUTI AS quantidade, COALESCE(CT.UNIME2, '') AS unidade
+            FROM E700CMM C
+            LEFT JOIN E700CTM CT ON CT.CODEMP = C.CODEMP AND CT.CODMOD = C.CODMOD AND CT.CODETG = C.CODETG AND CT.SEQMOD = C.SEQMOD
+            LEFT JOIN E075PRO P ON P.CODEMP = C.CODEMP AND P.CODPRO = C.CODCMP
+            WHERE C.CODEMP = ? AND C.CODMOD IN ({marcas})
+            ORDER BY C.CODMOD, C.CODETG, C.SEQMOD
+            """,
+            [codemp, *parte],
+        )
+        for p in _rows(cur):
+            saida.setdefault(_clean(p.pop("modelo")), []).append(p)
+    return saida
+
+
+def _conjuntos_da_peca(cur, codemp: int, codpro: str) -> list[dict[str, Any]]:
+    """Em quais modelos (conjuntos) a peça entra como componente."""
+    cur.execute(
+        """
+        SELECT C.CODMOD AS conjunto, COALESCE(M.DESMOD, '') AS descricao, C.CODETG AS etapa, C.SEQMOD AS seq,
+               CT.QTDUTI AS quantidade, COALESCE(M.CODFAM, '') AS familia
+        FROM E700CMM C
+        LEFT JOIN E700MOD M ON M.CODEMP = C.CODEMP AND M.CODMOD = C.CODMOD
+        LEFT JOIN E700CTM CT ON CT.CODEMP = C.CODEMP AND CT.CODMOD = C.CODMOD AND CT.CODETG = C.CODETG AND CT.SEQMOD = C.SEQMOD
+        WHERE C.CODEMP = ? AND C.CODCMP = ?
+        ORDER BY C.CODMOD
+        """,
+        [codemp, codpro],
+    )
+    return _rows(cur)
+
+
+def _montar_pecas(cur, codemp: int, pecas: list[dict[str, Any]], listar_imagens: bool) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Para uma lista de peças: OPs de cada peça e os materiais/lotes de cada OP. Devolve (dados, resumo)."""
+    ops_por_peca = _ops_por_produto(cur, codemp, [p["peca"] for p in pecas])
+    todas_ops = [(o["origem_op"], o["op"]) for lst in ops_por_peca.values() for o in lst]
+    materiais = _materiais_por_ops(cur, codemp, todas_ops, listar_imagens)
+    dados = []
+    lotes_set, forn_set = set(), set()
+    pecas_com_op = pecas_com_lote = 0
+    for p in pecas:
+        ops = []
+        tem_lote = False
+        for o in ops_por_peca.get(_clean(p["peca"]), []):
+            mats = materiais.get((o["origem_op"], int(o["op"])), [])
+            for m in mats:
+                if m.get("lote"):
+                    tem_lote = True
+                    lotes_set.add(m["lote"])
+                    if m.get("fornecedor"):
+                        forn_set.add(m["fornecedor"])
+            ops.append({**o, "materiais": mats, "resumo": _resumo_materiais(mats)})
+        if ops:
+            pecas_com_op += 1
+        if tem_lote:
+            pecas_com_lote += 1
+        dados.append({**p, "ops": ops})
+    resumo = {"pecas": len(pecas), "pecas_com_op": pecas_com_op, "pecas_com_lote": pecas_com_lote,
+              "pecas_sem_op": len(pecas) - pecas_com_op, "lotes_distintos": len(lotes_set),
+              "fornecedores_distintos": len(forn_set)}
+    return dados, resumo
+
+
+def _desenho_do_produto(cur, codemp: int, codpro: str) -> Optional[dict[str, Any]]:
+    """Obra/desenho/revisão em que o produto (conjunto) aparece na relação de elementos (última revisão)."""
+    cur.execute(
+        """
+        SELECT TOP 1 R.USU_NUMPRJ AS obra, COALESCE(PRJ.NOMPRJ, '') AS nome_projeto,
+               R.USU_NUMDES AS desenho, COALESCE(R.USU_REVDES, '') AS revisao, R.USU_ITEREE AS item_elemento,
+               R.USU_QTDPRO AS quantidade_prevista, R.USU_PESREA AS peso_unitario, R.USU_QTDETQ AS qtd_etiquetas
+        FROM USU_T900REE R
+        LEFT JOIN E615PRJ PRJ ON PRJ.CODEMP = R.USU_CODEMP AND PRJ.NUMPRJ = R.USU_NUMPRJ
+        WHERE R.USU_CODEMP = ? AND R.USU_CODPRO = ?
+        ORDER BY R.USU_NUMPRJ DESC, R.USU_NUMDES DESC, R.USU_REVDES DESC
+        """,
+        [codemp, codpro],
+    )
+    linhas = _rows(cur)
+    return linhas[0] if linhas else None
+
+
 # =============================================================================
 # 1) OP -> lotes de matéria-prima
 # =============================================================================
@@ -240,10 +446,17 @@ def lotes_da_ordem_producao(
     op: int,
     empresa: int = Query(default=None),
     listar_imagens_certificados: str = Query(default="S"),
+    incluir_conjuntos: str = Query(default="N"),
     user=Depends(_dep_usuario),
 ):
     """Lotes de matéria-prima consumidos por uma OP: nota fiscal, fornecedor, certificado,
-    itens da nota e imagens (com arquivo_url, como na rastreabilidade de tintas)."""
+    itens da nota e imagens (com arquivo_url, como na rastreabilidade de tintas).
+
+    incluir_conjuntos=S acrescenta ao cabeçalho:
+    - `conjuntos`: em quais conjuntos a peça desta OP entra (E700CMM) e as OPs desses conjuntos (TKC);
+    - `operacao` + `pecas_operacao`: para OP de desenho manual (origem 100), a operação do desenho
+      (USU_T900COP) e as peças/marcas cortadas nela (USU_T900QDO).
+    """
     codemp = empresa or _empresa_padrao()
     origem = _clean(origem)
     if not origem:
@@ -251,6 +464,7 @@ def lotes_da_ordem_producao(
     if not op or op < 1:
         raise HTTPException(status_code=400, detail="Informe o número da OP.")
     listar_imagens = _clean(listar_imagens_certificados).upper() != "N"
+    com_conjuntos = _clean(incluir_conjuntos).upper() == "S"
 
     conn = _svc("get_connection")()
     try:
@@ -260,69 +474,73 @@ def lotes_da_ordem_producao(
             raise HTTPException(status_code=404, detail="Ordem de produção não encontrada.")
 
         cur.execute(
-            """
-            SELECT
-                LCM.USU_SEQ                      AS seq,
-                LCM.USU_CODETG                   AS etapa,
-                LCM.USU_SEQCMP                   AS seq_componente,
-                COALESCE(LCM.USU_CODCMP, '')     AS codigo_componente,
-                COALESCE(LCM.USU_DERCMP, '')     AS derivacao,
-                COALESCE(PRO.DESPRO, '')         AS descricao_produto,
-                COALESCE(PRO.CODFAM, '')         AS familia,
-                COALESCE(FAM.DESFAM, '')         AS descricao_familia,
-                COALESCE(LCM.USU_CMPSBS, '')     AS componente_substituto,
-                COALESCE(LCM.USU_DERSBS, '')     AS derivacao_substituto,
-                LTRIM(RTRIM(COALESCE(LCM.USU_CODLOT, ''))) AS lote,
-                LCM.USU_NUMPRJ                   AS obra,
-                LCM.USU_NUMDES                   AS desenho,
-                COALESCE(LCM.USU_REVDES, '')     AS revisao,
-                LCM.USU_DATGER                   AS data_lancamento,
-                LCM.USU_USUGER                   AS usuario_lancamento
-            FROM USU_T900LCM LCM
-            LEFT JOIN E075PRO PRO ON PRO.CODEMP = LCM.USU_CODEMP AND PRO.CODPRO = LCM.USU_CODCMP
-            LEFT JOIN E012FAM FAM ON FAM.CODEMP = PRO.CODEMP AND FAM.CODFAM = PRO.CODFAM
-            WHERE LCM.USU_CODEMP = ? AND LCM.USU_CODORI = ? AND LCM.USU_NUMORP = ?
-            ORDER BY LCM.USU_SEQ, LCM.USU_CODLOT
-            """,
+            _SQL_VINCULOS_BASE
+            + " WHERE LCM.USU_CODEMP = ? AND LCM.USU_CODORI = ? AND LCM.USU_NUMORP = ? ORDER BY LCM.USU_SEQ, LCM.USU_CODLOT",
             [codemp, origem, op],
         )
         vinculos = _rows(cur)
         lotes = _carregar_lotes(cur, codemp, [v["lote"] for v in vinculos if v["lote"]], listar_imagens)
+
+        extras: dict[str, Any] = {}
+        if com_conjuntos:
+            # Conjuntos em que a peça desta OP entra (Tekla: OP TKE = peça; conjunto = modelo E700CMM)
+            conjuntos = _conjuntos_da_peca(cur, codemp, cab_op["codigo_produto"])
+            ops_conj = _ops_por_produto(cur, codemp, [c["conjunto"] for c in conjuntos])
+            for c in conjuntos:
+                c["ops"] = ops_conj.get(_clean(c["conjunto"]), [])
+                d = _desenho_do_produto(cur, codemp, c["conjunto"])
+                c["obra"] = d["obra"] if d else None
+                c["nome_projeto"] = d["nome_projeto"] if d else ""
+                c["desenho"] = d["desenho"] if d else None
+                c["revisao"] = d["revisao"] if d else ""
+            extras["conjuntos"] = conjuntos
+            # Operação do desenho (origem 100) e as peças cortadas nela
+            cur.execute(
+                """
+                SELECT TOP 1 C.USU_NUMPRJ AS obra, COALESCE(PRJ.NOMPRJ, '') AS nome_projeto, C.USU_NUMDES AS desenho,
+                       COALESCE(C.USU_REVDES, '') AS revisao, C.USU_SEQOPR AS seq_operacao,
+                       COALESCE(C.USU_DESOPR, '') AS descricao_operacao, COALESCE(C.USU_CODOPR, '') AS codigo_operacao
+                FROM USU_T900COP C
+                LEFT JOIN E615PRJ PRJ ON PRJ.CODEMP = C.USU_CODEMP AND PRJ.NUMPRJ = C.USU_NUMPRJ
+                WHERE C.USU_CODEMP = ? AND C.USU_CODORI = ? AND C.USU_NUMORP = ?
+                ORDER BY C.USU_REVDES DESC
+                """,
+                [codemp, origem, op],
+            )
+            oper = _rows(cur)
+            extras["operacao"] = oper[0] if oper else None
+            pecas_op: list[dict[str, Any]] = []
+            if oper:
+                o = oper[0]
+                cur.execute(
+                    """
+                    SELECT Q.USU_ITEOPR AS item, Q.USU_DESPEC AS peca, Q.USU_QTDPEC AS quantidade,
+                           COALESCE(Q.USU_CODMPR, '') AS materia_prima, COALESCE(Q.USU_DERMPR, '') AS derivacao_mp,
+                           COALESCE(MPR.USU_CODSEN, '') AS codigo_materia_prima,
+                           Q.USU_COMPEC AS comprimento, Q.USU_LARPEC AS largura, Q.USU_TOTKGS AS peso_total_kg,
+                           COALESCE(Q.USU_CODORI, '') AS origem_op_peca, Q.USU_NUMORP AS op_peca
+                    FROM USU_T900QDO Q
+                    LEFT JOIN USU_T900MPR MPR ON MPR.USU_CODEMP = Q.USU_CODEMP AND MPR.USU_CODMPR = Q.USU_CODMPR AND MPR.USU_DERMPR = Q.USU_DERMPR
+                    WHERE Q.USU_CODEMP = ? AND Q.USU_NUMPRJ = ? AND Q.USU_NUMDES = ? AND Q.USU_REVDES = ? AND Q.USU_SEQOPR = ?
+                    ORDER BY Q.USU_ITEOPR
+                    """,
+                    [codemp, o["obra"], o["desenho"], o["revisao"], o["seq_operacao"]],
+                )
+                pecas_op = _rows(cur)
+            extras["pecas_operacao"] = pecas_op
     finally:
         conn.close()
 
-    dados = []
-    for v in vinculos:
-        lote = _clean(v.get("lote"))
-        detalhe = lotes.get(lote) if lote else None
-        linha = {**v, "lote": lote, "data_lancamento_br": _data_br(v.get("data_lancamento")),
-                 "lote_cadastrado": detalhe is not None,
-                 "produto": v["codigo_componente"], "descricao": v["descricao_produto"]}
-        if detalhe is not None:
-            linha.update(detalhe)
-        else:
-            linha.update(_CAMPOS_LOTE_VAZIOS)
-            if listar_imagens:
-                linha.update({"qtd_imagens_certificados": 0, "certificados_imagens": [], "certificados_detalhe": []})
-        dados.append(linha)
-
-    com_lote = [d for d in dados if d["lote"]]
-    resumo = {
-        "vinculos": len(dados),
-        "com_lote": len(com_lote),
-        "sem_lote": len(dados) - len(com_lote),
-        "lotes_distintos": len({d["lote"] for d in com_lote}),
-        "lotes_sem_cadastro": len({d["lote"] for d in com_lote if not d["lote_cadastrado"]}),
-        "fornecedores_distintos": len({d["fornecedor"] for d in com_lote if d.get("fornecedor")}),
-        "componentes_distintos": len({d["codigo_componente"] for d in dados}),
-    }
-    return {
-        "ok": True,
-        "total": len(dados),
-        "cabecalho": {"titulo": "LOTES DE MATÉRIA PRIMA DA ORDEM DE PRODUÇÃO", **cab_op,
-                      "listar_imagens_certificados": "S" if listar_imagens else "N", "resumo": resumo},
-        "dados": dados,
-    }
+    dados = [_linha_material(v, lotes, listar_imagens) for v in vinculos]
+    for d in dados:
+        d.pop("origem_op", None)
+        d.pop("op", None)
+    resumo = _resumo_materiais(dados)
+    cabecalho = {"titulo": "LOTES DE MATÉRIA PRIMA DA ORDEM DE PRODUÇÃO", **cab_op,
+                 "listar_imagens_certificados": "S" if listar_imagens else "N",
+                 "incluir_conjuntos": "S" if com_conjuntos else "N", "resumo": resumo}
+    cabecalho.update(extras)
+    return {"ok": True, "total": len(dados), "cabecalho": cabecalho, "dados": dados}
 
 
 # =============================================================================
@@ -403,6 +621,160 @@ def ordens_producao_do_lote(
         "componentes_distintos": len({o["codigo_componente"] for o in ordens}),
     }
     return {"ok": True, "total": len(ordens), "cabecalho": cabecalho, "dados": ordens}
+
+
+# =============================================================================
+# 2b) Conjunto -> peças -> OPs -> lotes  (Tekla: conjunto = modelo E700CMM; peça = OP TKE)
+# =============================================================================
+
+@router.get("/api/erp/conjuntos/{codigo}/rastreabilidade")
+def rastreabilidade_conjunto(
+    codigo: str,
+    empresa: int = Query(default=None),
+    listar_imagens_certificados: str = Query(default="N"),
+    user=Depends(_dep_usuario),
+):
+    """Que aço foi para este conjunto (viga, pilar...): peças do modelo (E700CMM), OP de cada peça
+    (E900COP) e os lotes apontados em cada OP (USU_T900LCM → NF, fornecedor, certificado).
+
+    - 404 se o código não existe como produto nem como modelo.
+    - Conjunto sem modelo (desenhos manuais, origem 100) responde 200 com `dados=[]` e aviso.
+    - Imagens desligadas por padrão (muitas OPs por conjunto); ligue com listar_imagens_certificados=S.
+    """
+    codemp = empresa or _empresa_padrao()
+    codigo = _clean(codigo)
+    if not codigo:
+        raise HTTPException(status_code=400, detail="Informe o código do conjunto.")
+    listar_imagens = _clean(listar_imagens_certificados).upper() == "S"
+
+    conn = _svc("get_connection")()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT P.CODPRO AS codigo, COALESCE(P.DESPRO, '') AS descricao, COALESCE(P.CODFAM, '') AS familia,
+                   COALESCE(P.TIPPRO, '') AS tipo_produto, COALESCE(P.SITPRO, '') AS situacao,
+                   COALESCE(P.CODMOD, '') AS modelo, P.PESLIQ AS peso_liquido
+            FROM E075PRO P WHERE P.CODEMP = ? AND P.CODPRO = ?
+            """,
+            [codemp, codigo],
+        )
+        prod = _rows(cur)
+        conjunto = prod[0] if prod else {"codigo": codigo, "descricao": "", "familia": "", "tipo_produto": "",
+                                         "situacao": "", "modelo": "", "peso_liquido": None}
+        codmod = _clean(conjunto.get("modelo")) or codigo
+        pecas = _pecas_dos_modelos(cur, codemp, [codmod]).get(codmod, [])
+        if not prod and not pecas:
+            raise HTTPException(status_code=404, detail="Conjunto não encontrado (nem produto, nem modelo).")
+
+        ops_conjunto = _ops_por_produto(cur, codemp, [codigo]).get(codigo, [])
+        desenho = _desenho_do_produto(cur, codemp, codigo)
+        dados, resumo = _montar_pecas(cur, codemp, pecas, listar_imagens)
+    finally:
+        conn.close()
+
+    aviso = "" if pecas else "Conjunto sem modelo/estrutura no ERP (desenho manual): composição peça → conjunto não registrada."
+    cabecalho = {
+        "titulo": "RASTREABILIDADE DE MATÉRIA PRIMA DO CONJUNTO",
+        "empresa": codemp, **conjunto, "modelo": codmod,
+        "obra": desenho["obra"] if desenho else None,
+        "nome_projeto": desenho["nome_projeto"] if desenho else "",
+        "desenho": desenho["desenho"] if desenho else None,
+        "revisao": desenho["revisao"] if desenho else "",
+        "item_elemento": desenho["item_elemento"] if desenho else None,
+        "quantidade_prevista": desenho["quantidade_prevista"] if desenho else None,
+        "ops_conjunto": ops_conjunto,
+        "listar_imagens_certificados": "S" if listar_imagens else "N",
+        "aviso": aviso,
+        "resumo": resumo,
+    }
+    return {"ok": True, "total": len(dados), "cabecalho": cabecalho, "dados": dados}
+
+
+# =============================================================================
+# 2c) Desenho (obra/desenho/revisão) -> conjuntos -> peças -> OPs -> lotes
+# =============================================================================
+
+@router.get("/api/erp/desenhos/{obra}/{desenho}/{revisao}/rastreabilidade")
+def rastreabilidade_desenho(
+    obra: int,
+    desenho: int,
+    revisao: str,
+    empresa: int = Query(default=None),
+    listar_imagens_certificados: str = Query(default="N"),
+    user=Depends(_dep_usuario),
+):
+    """Todos os conjuntos fabricados de um desenho (USU_T900REE, TIPPRO='P') com suas peças, OPs e lotes.
+    Itens comerciais (parafusos etc.) ficam fora: já existem em /api/erp/rastreabilidade-itens-comerciais."""
+    codemp = empresa or _empresa_padrao()
+    revisao = _clean(revisao)
+    if not obra or not desenho or not revisao:
+        raise HTTPException(status_code=400, detail="Informe obra, desenho e revisão.")
+    listar_imagens = _clean(listar_imagens_certificados).upper() == "S"
+
+    conn = _svc("get_connection")()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT R.USU_ITEREE AS item_elemento, R.USU_CODPRO AS codigo, COALESCE(R.USU_DESPRO, '') AS descricao,
+                   COALESCE(P.DESPRO, '') AS descricao_cadastro, COALESCE(P.CODMOD, '') AS modelo,
+                   R.USU_QTDPRO AS quantidade_prevista, R.USU_PESREA AS peso_unitario, R.USU_QTDETQ AS qtd_etiquetas,
+                   COALESCE(PRJ.NOMPRJ, '') AS nome_projeto
+            FROM USU_T900REE R
+            LEFT JOIN E075PRO P ON P.CODEMP = R.USU_CODEMP AND P.CODPRO = R.USU_CODPRO
+            LEFT JOIN E615PRJ PRJ ON PRJ.CODEMP = R.USU_CODEMP AND PRJ.NUMPRJ = R.USU_NUMPRJ
+            WHERE R.USU_CODEMP = ? AND R.USU_NUMPRJ = ? AND R.USU_NUMDES = ? AND R.USU_REVDES = ?
+              AND COALESCE(P.TIPPRO, 'P') <> 'C'
+            ORDER BY R.USU_ITEREE
+            """,
+            [codemp, obra, desenho, revisao],
+        )
+        conjuntos = _rows(cur)
+        if not conjuntos:
+            cur.execute("SELECT TOP 1 1 FROM USU_T900PRJ WHERE USU_CODEMP = ? AND USU_NUMPRJ = ? AND USU_NUMDES = ? AND USU_REVDES = ?",
+                        [codemp, obra, desenho, revisao])
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Desenho/revisão não encontrado.")
+
+        nome_projeto = conjuntos[0]["nome_projeto"] if conjuntos else ""
+        for c in conjuntos:
+            c.pop("nome_projeto", None)
+            c["modelo"] = _clean(c.get("modelo")) or _clean(c["codigo"])
+        pecas_por_modelo = _pecas_dos_modelos(cur, codemp, [c["modelo"] for c in conjuntos])
+        ops_conj = _ops_por_produto(cur, codemp, [c["codigo"] for c in conjuntos])
+        todas_pecas = [dict(p, _modelo=m) for m, lst in pecas_por_modelo.items() for p in lst]
+        dados_pecas, _ = _montar_pecas(cur, codemp, todas_pecas, listar_imagens)
+    finally:
+        conn.close()
+
+    por_modelo: dict[str, list[dict[str, Any]]] = {}
+    for p in dados_pecas:
+        por_modelo.setdefault(p.pop("_modelo"), []).append(p)
+    dados = []
+    tot = {"conjuntos": len(conjuntos), "conjuntos_com_modelo": 0, "pecas": 0, "pecas_com_lote": 0, "lotes_distintos": set()}
+    for c in conjuntos:
+        pecas = por_modelo.get(c["modelo"], [])
+        if pecas:
+            tot["conjuntos_com_modelo"] += 1
+        tot["pecas"] += len(pecas)
+        for p in pecas:
+            if any(m.get("lote") for o in p["ops"] for m in o["materiais"]):
+                tot["pecas_com_lote"] += 1
+            for o in p["ops"]:
+                for m in o["materiais"]:
+                    if m.get("lote"):
+                        tot["lotes_distintos"].add(m["lote"])
+        dados.append({**c, "ops_conjunto": ops_conj.get(_clean(c["codigo"]), []), "pecas": pecas})
+    tot["lotes_distintos"] = len(tot["lotes_distintos"])
+    return {
+        "ok": True,
+        "total": len(dados),
+        "cabecalho": {"titulo": "RASTREABILIDADE DE MATÉRIA PRIMA DO DESENHO", "empresa": codemp,
+                      "obra": obra, "nome_projeto": nome_projeto, "desenho": desenho, "revisao": revisao,
+                      "listar_imagens_certificados": "S" if listar_imagens else "N", "resumo": tot},
+        "dados": dados,
+    }
 
 
 # =============================================================================
