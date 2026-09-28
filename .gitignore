@@ -20,3 +20,10 @@ Thumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# Lixo de execucao / backups (nunca versionar)
+nohup.out
+*.bak-*
+*.log
+# Pasta criada por engano quando FINAL_SERVER_BASE_PATH era caminho Windows rodando no Linux
+\\*
