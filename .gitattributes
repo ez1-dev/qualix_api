@@ -1,0 +1,2 @@
+# Normaliza quebras de linha: o repositorio roda em Linux, sempre LF no commit
+* text=auto eol=lf

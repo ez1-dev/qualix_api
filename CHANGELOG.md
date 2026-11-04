@@ -594,6 +594,30 @@ desenho 670/1013/A → 25 conjuntos, 24 com modelo, 123 peças; desenho 655/2462
 
 ---
 
+## 19. Peso líquido do elemento/peça e família (código + descrição)
+
+Onde o peso **realmente** está (validado 04/11/2026): `E075PRO.PESLIQ` é **zero** em todos os itens Tekla.
+- **Elemento/conjunto**: `USU_T900REE.USU_PESREA` (peso unitário real; 11.922 de 12.124 elementos de 2026).
+- **Peça**: `USU_T900QDO.USU_TOTKGS / USU_QTDPEC` por marca (19.858 de 19.920 OPs TKE de 2026).
+- **Família**: `E075PRO.CODFAM` + `E012FAM.DESFAM` (`TKC` = TEKLA - CONJUNTOS, `TKE` = TEKLA - ELEMENTOS, `100` = PROJETOS - ESTRUTURAS METÁLICAS).
+
+**Campos novos (todos aditivos; nenhum campo existente mudou de nome ou valor, exceto um, abaixo):**
+- `GET /api/erp/desenhos/.../rastreabilidade` → `dados[]`: `familia`, `descricao_familia`, `peso_liquido_unitario`,
+  `peso_liquido_total` (= quantidade_prevista × unitário); `pecas[]`: `familia`, `descricao_familia`,
+  `peso_liquido_unitario`, `peso_liquido_total` (= quantidade no modelo × unitário); `cabecalho.resumo.peso_liquido_total`.
+- `GET /api/erp/conjuntos/{codigo}/rastreabilidade` → `cabecalho`: `descricao_familia`, `peso_liquido_unitario`,
+  `peso_liquido_total`; `resumo.peso_liquido_pecas_total`; peças com os mesmos campos acima.
+  ⚠️ `cabecalho.peso_liquido` (cadastro, sempre 0) foi **renomeado** para `peso_liquido_cadastro`.
+- `GET /api/erp/ordens-producao/{origem}/{op}/lotes` → `cabecalho`: `descricao_familia`, `peso_liquido_unitario`,
+  `peso_liquido_total` (× quantidade_prevista), `peso_origem` (`ELEMENTO` via REE, `PECA` via QDO, vazio se não há);
+  com `incluir_conjuntos=S`, cada `conjuntos[]` traz `descricao_familia`, `quantidade_prevista`, `peso_liquido_unitario`, `peso_liquido_total`.
+
+Validado: PT1 = 467,009 kg (TKC, TEKLA - CONJUNTOS); peça W16 = 132,858 kg × 2 = 265,716 (TKE); LG3 = 14 × 25,781;
+desenho 670/1013/A = 2.893,593 kg em 25 conjuntos; OP TKC 5260 peso_origem ELEMENTO; OP TKE 15975 peso_origem PECA;
+desenho manual 655/2462/A traz peso dos conjuntos (REE) e família 100. Regressão ok.
+
+---
+
 ## Resumo de endpoints novos
 
 | Método | Rota |
