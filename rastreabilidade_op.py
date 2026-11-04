@@ -318,10 +318,21 @@ def _pecas_dos_modelos(cur, codemp: int, codmods: list[str]) -> dict[str, list[d
             SELECT C.CODMOD AS modelo, C.CODETG AS etapa, C.SEQMOD AS seq,
                    C.CODCMP AS peca, COALESCE(C.DESCMP, '') AS descricao,
                    COALESCE(P.DESPRO, '') AS descricao_cadastro, COALESCE(P.TIPPRO, '') AS tipo_produto,
-                   CT.QTDUTI AS quantidade, COALESCE(CT.UNIME2, '') AS unidade
+                   COALESCE(P.CODFAM, '') AS familia, COALESCE(FAM.DESFAM, '') AS descricao_familia,
+                   CT.QTDUTI AS quantidade, COALESCE(CT.UNIME2, '') AS unidade,
+                   KG.kg_unit AS peso_liquido_unitario,
+                   CASE WHEN KG.kg_unit IS NOT NULL THEN KG.kg_unit * COALESCE(CT.QTDUTI, 1) END AS peso_liquido_total
             FROM E700CMM C
             LEFT JOIN E700CTM CT ON CT.CODEMP = C.CODEMP AND CT.CODMOD = C.CODMOD AND CT.CODETG = C.CODETG AND CT.SEQMOD = C.SEQMOD
             LEFT JOIN E075PRO P ON P.CODEMP = C.CODEMP AND P.CODPRO = C.CODCMP
+            LEFT JOIN E012FAM FAM ON FAM.CODEMP = P.CODEMP AND FAM.CODFAM = P.CODFAM
+            OUTER APPLY (
+                -- peso da peça: kg total / quantidade da marca na operação do desenho (USU_T900QDO)
+                SELECT TOP 1 Q.USU_TOTKGS / NULLIF(Q.USU_QTDPEC, 0) AS kg_unit
+                FROM USU_T900QDO Q
+                WHERE Q.USU_CODEMP = C.CODEMP AND Q.USU_DESPEC = C.CODCMP AND Q.USU_TOTKGS > 0
+                ORDER BY Q.USU_REVDES DESC
+            ) KG
             WHERE C.CODEMP = ? AND C.CODMOD IN ({marcas})
             ORDER BY C.CODMOD, C.CODETG, C.SEQMOD
             """,
@@ -337,9 +348,10 @@ def _conjuntos_da_peca(cur, codemp: int, codpro: str) -> list[dict[str, Any]]:
     cur.execute(
         """
         SELECT C.CODMOD AS conjunto, COALESCE(M.DESMOD, '') AS descricao, C.CODETG AS etapa, C.SEQMOD AS seq,
-               CT.QTDUTI AS quantidade, COALESCE(M.CODFAM, '') AS familia
+               CT.QTDUTI AS quantidade, COALESCE(M.CODFAM, '') AS familia, COALESCE(FAM.DESFAM, '') AS descricao_familia
         FROM E700CMM C
         LEFT JOIN E700MOD M ON M.CODEMP = C.CODEMP AND M.CODMOD = C.CODMOD
+        LEFT JOIN E012FAM FAM ON FAM.CODEMP = M.CODEMP AND FAM.CODFAM = M.CODFAM
         LEFT JOIN E700CTM CT ON CT.CODEMP = C.CODEMP AND CT.CODMOD = C.CODMOD AND CT.CODETG = C.CODETG AND CT.SEQMOD = C.SEQMOD
         WHERE C.CODEMP = ? AND C.CODCMP = ?
         ORDER BY C.CODMOD
@@ -376,7 +388,8 @@ def _montar_pecas(cur, codemp: int, pecas: list[dict[str, Any]], listar_imagens:
         dados.append({**p, "ops": ops})
     resumo = {"pecas": len(pecas), "pecas_com_op": pecas_com_op, "pecas_com_lote": pecas_com_lote,
               "pecas_sem_op": len(pecas) - pecas_com_op, "lotes_distintos": len(lotes_set),
-              "fornecedores_distintos": len(forn_set)}
+              "fornecedores_distintos": len(forn_set),
+              "peso_liquido_pecas_total": round(sum(float(p.get("peso_liquido_total") or 0) for p in pecas), 3)}
     return dados, resumo
 
 
@@ -386,9 +399,14 @@ def _desenho_do_produto(cur, codemp: int, codpro: str) -> Optional[dict[str, Any
         """
         SELECT TOP 1 R.USU_NUMPRJ AS obra, COALESCE(PRJ.NOMPRJ, '') AS nome_projeto,
                R.USU_NUMDES AS desenho, COALESCE(R.USU_REVDES, '') AS revisao, R.USU_ITEREE AS item_elemento,
-               R.USU_QTDPRO AS quantidade_prevista, R.USU_PESREA AS peso_unitario, R.USU_QTDETQ AS qtd_etiquetas
+               R.USU_QTDPRO AS quantidade_prevista, R.USU_PESREA AS peso_unitario, R.USU_QTDETQ AS qtd_etiquetas,
+               R.USU_PESREA AS peso_liquido_unitario,
+               R.USU_PESREA * COALESCE(R.USU_QTDPRO, 1) AS peso_liquido_total,
+               COALESCE(P.CODFAM, '') AS familia, COALESCE(FAM.DESFAM, '') AS descricao_familia
         FROM USU_T900REE R
         LEFT JOIN E615PRJ PRJ ON PRJ.CODEMP = R.USU_CODEMP AND PRJ.NUMPRJ = R.USU_NUMPRJ
+        LEFT JOIN E075PRO P ON P.CODEMP = R.USU_CODEMP AND P.CODPRO = R.USU_CODPRO
+        LEFT JOIN E012FAM FAM ON FAM.CODEMP = P.CODEMP AND FAM.CODFAM = P.CODFAM
         WHERE R.USU_CODEMP = ? AND R.USU_CODPRO = ?
         ORDER BY R.USU_NUMPRJ DESC, R.USU_NUMDES DESC, R.USU_REVDES DESC
         """,
@@ -412,6 +430,7 @@ def _cabecalho_op(cur, codemp: int, origem: str, op: int) -> Optional[dict[str, 
             COALESCE(C.CODPRO, '')   AS codigo_produto,
             COALESCE(P.DESPRO, '')   AS descricao_produto,
             COALESCE(C.CODFAM, '')   AS familia,
+            COALESCE(FAM.DESFAM, '') AS descricao_familia,
             COALESCE(C.SITORP, '')   AS situacao,
             COALESCE(C.TIPORP, '')   AS tipo_op,
             C.DATGER                 AS data_geracao,
@@ -423,9 +442,24 @@ def _cabecalho_op(cur, codemp: int, origem: str, op: int) -> Optional[dict[str, 
             C.QTDRE1                 AS quantidade_realizada,
             C.NUMPED                 AS pedido,
             COALESCE(C.RELPRD, '')   AS relatorio_producao,
-            COALESCE(C.OBSORP, '')   AS observacao
+            COALESCE(C.OBSORP, '')   AS observacao,
+            -- peso líquido do produto da OP: conjunto (USU_T900REE.USU_PESREA) ou peça (USU_T900QDO kg/qtd)
+            COALESCE(REE.peso_unit, KG.kg_unit)                                   AS peso_liquido_unitario,
+            COALESCE(REE.peso_unit, KG.kg_unit) * COALESCE(C.QTDPRV, 1)           AS peso_liquido_total,
+            CASE WHEN REE.peso_unit IS NOT NULL THEN 'ELEMENTO' WHEN KG.kg_unit IS NOT NULL THEN 'PECA' ELSE '' END AS peso_origem
         FROM E900COP C
         LEFT JOIN E075PRO P ON P.CODEMP = C.CODEMP AND P.CODPRO = C.CODPRO
+        LEFT JOIN E012FAM FAM ON FAM.CODEMP = C.CODEMP AND FAM.CODFAM = C.CODFAM
+        OUTER APPLY (
+            SELECT TOP 1 R.USU_PESREA AS peso_unit FROM USU_T900REE R
+            WHERE R.USU_CODEMP = C.CODEMP AND R.USU_CODPRO = C.CODPRO AND R.USU_PESREA > 0
+            ORDER BY R.USU_NUMPRJ DESC, R.USU_NUMDES DESC, R.USU_REVDES DESC
+        ) REE
+        OUTER APPLY (
+            SELECT TOP 1 Q.USU_TOTKGS / NULLIF(Q.USU_QTDPEC, 0) AS kg_unit FROM USU_T900QDO Q
+            WHERE Q.USU_CODEMP = C.CODEMP AND Q.USU_DESPEC = C.CODPRO AND Q.USU_TOTKGS > 0
+            ORDER BY Q.USU_REVDES DESC
+        ) KG
         WHERE C.CODEMP = ? AND C.CODORI = ? AND C.NUMORP = ?
         """,
         [codemp, origem, op],
@@ -493,6 +527,12 @@ def lotes_da_ordem_producao(
                 c["nome_projeto"] = d["nome_projeto"] if d else ""
                 c["desenho"] = d["desenho"] if d else None
                 c["revisao"] = d["revisao"] if d else ""
+                c["quantidade_prevista"] = d["quantidade_prevista"] if d else None
+                c["peso_liquido_unitario"] = d["peso_liquido_unitario"] if d else None
+                c["peso_liquido_total"] = d["peso_liquido_total"] if d else None
+                if d and d.get("familia"):
+                    c["familia"] = d["familia"]
+                    c["descricao_familia"] = d["descricao_familia"]
             extras["conjuntos"] = conjuntos
             # Operação do desenho (origem 100) e as peças cortadas nela
             cur.execute(
@@ -653,15 +693,18 @@ def rastreabilidade_conjunto(
         cur.execute(
             """
             SELECT P.CODPRO AS codigo, COALESCE(P.DESPRO, '') AS descricao, COALESCE(P.CODFAM, '') AS familia,
+                   COALESCE(FAM.DESFAM, '') AS descricao_familia,
                    COALESCE(P.TIPPRO, '') AS tipo_produto, COALESCE(P.SITPRO, '') AS situacao,
-                   COALESCE(P.CODMOD, '') AS modelo, P.PESLIQ AS peso_liquido
-            FROM E075PRO P WHERE P.CODEMP = ? AND P.CODPRO = ?
+                   COALESCE(P.CODMOD, '') AS modelo, P.PESLIQ AS peso_liquido_cadastro
+            FROM E075PRO P
+            LEFT JOIN E012FAM FAM ON FAM.CODEMP = P.CODEMP AND FAM.CODFAM = P.CODFAM
+            WHERE P.CODEMP = ? AND P.CODPRO = ?
             """,
             [codemp, codigo],
         )
         prod = _rows(cur)
-        conjunto = prod[0] if prod else {"codigo": codigo, "descricao": "", "familia": "", "tipo_produto": "",
-                                         "situacao": "", "modelo": "", "peso_liquido": None}
+        conjunto = prod[0] if prod else {"codigo": codigo, "descricao": "", "familia": "", "descricao_familia": "",
+                                         "tipo_produto": "", "situacao": "", "modelo": "", "peso_liquido_cadastro": None}
         codmod = _clean(conjunto.get("modelo")) or codigo
         pecas = _pecas_dos_modelos(cur, codemp, [codmod]).get(codmod, [])
         if not prod and not pecas:
@@ -683,6 +726,9 @@ def rastreabilidade_conjunto(
         "revisao": desenho["revisao"] if desenho else "",
         "item_elemento": desenho["item_elemento"] if desenho else None,
         "quantidade_prevista": desenho["quantidade_prevista"] if desenho else None,
+        # peso líquido do ELEMENTO vem da relação de elementos (USU_T900REE.USU_PESREA); o cadastro (E075PRO) é zero nos itens Tekla
+        "peso_liquido_unitario": desenho["peso_liquido_unitario"] if desenho else None,
+        "peso_liquido_total": desenho["peso_liquido_total"] if desenho else None,
         "ops_conjunto": ops_conjunto,
         "listar_imagens_certificados": "S" if listar_imagens else "N",
         "aviso": aviso,
@@ -719,10 +765,14 @@ def rastreabilidade_desenho(
             """
             SELECT R.USU_ITEREE AS item_elemento, R.USU_CODPRO AS codigo, COALESCE(R.USU_DESPRO, '') AS descricao,
                    COALESCE(P.DESPRO, '') AS descricao_cadastro, COALESCE(P.CODMOD, '') AS modelo,
+                   COALESCE(P.CODFAM, '') AS familia, COALESCE(FAM.DESFAM, '') AS descricao_familia,
                    R.USU_QTDPRO AS quantidade_prevista, R.USU_PESREA AS peso_unitario, R.USU_QTDETQ AS qtd_etiquetas,
+                   R.USU_PESREA AS peso_liquido_unitario,
+                   R.USU_PESREA * COALESCE(R.USU_QTDPRO, 1) AS peso_liquido_total,
                    COALESCE(PRJ.NOMPRJ, '') AS nome_projeto
             FROM USU_T900REE R
             LEFT JOIN E075PRO P ON P.CODEMP = R.USU_CODEMP AND P.CODPRO = R.USU_CODPRO
+            LEFT JOIN E012FAM FAM ON FAM.CODEMP = P.CODEMP AND FAM.CODFAM = P.CODFAM
             LEFT JOIN E615PRJ PRJ ON PRJ.CODEMP = R.USU_CODEMP AND PRJ.NUMPRJ = R.USU_NUMPRJ
             WHERE R.USU_CODEMP = ? AND R.USU_NUMPRJ = ? AND R.USU_NUMDES = ? AND R.USU_REVDES = ?
               AND COALESCE(P.TIPPRO, 'P') <> 'C'
@@ -752,9 +802,11 @@ def rastreabilidade_desenho(
     for p in dados_pecas:
         por_modelo.setdefault(p.pop("_modelo"), []).append(p)
     dados = []
-    tot = {"conjuntos": len(conjuntos), "conjuntos_com_modelo": 0, "pecas": 0, "pecas_com_lote": 0, "lotes_distintos": set()}
+    tot = {"conjuntos": len(conjuntos), "conjuntos_com_modelo": 0, "pecas": 0, "pecas_com_lote": 0, "lotes_distintos": set(),
+           "peso_liquido_total": 0.0}
     for c in conjuntos:
         pecas = por_modelo.get(c["modelo"], [])
+        tot["peso_liquido_total"] += float(c.get("peso_liquido_total") or 0)
         if pecas:
             tot["conjuntos_com_modelo"] += 1
         tot["pecas"] += len(pecas)
@@ -767,6 +819,7 @@ def rastreabilidade_desenho(
                         tot["lotes_distintos"].add(m["lote"])
         dados.append({**c, "ops_conjunto": ops_conj.get(_clean(c["codigo"]), []), "pecas": pecas})
     tot["lotes_distintos"] = len(tot["lotes_distintos"])
+    tot["peso_liquido_total"] = round(tot["peso_liquido_total"], 3)
     return {
         "ok": True,
         "total": len(dados),
